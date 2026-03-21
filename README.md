@@ -198,6 +198,41 @@ No SSH keys or open ports required — access is via AWS Systems Manager.
 ./infra/ops teardown --force       # Terminate all instances and remove everything
 ```
 
+## Limitations and future work
+
+### Re-apply behavior
+
+Changing a VMCluster spec and re-applying has limited support:
+
+- **If the instance is running**, re-apply reports "already running" and makes no changes. To apply a new configuration, destroy first and then re-apply. This means changes to instance type, disk size, k3s version, or ingress settings require a full reprovision.
+- **If the instance is terminated or gone**, re-apply provisions a fresh cluster.
+
+Future: detect spec changes and handle mutable updates (e.g., DNS changes) without full reprovision.
+
+### Refresh
+
+Refresh checks if the EC2 instance is still running and reports drift if it's stopped or terminated. It does not currently:
+
+- Verify k3s is healthy
+- Check if the ConfigHub worker is actually connected
+- Pull the kubeconfig into LiveState
+
+### Destroy
+
+Destroy deletes the worker deployment (clean disconnect), terminates the instance, removes the security group, and removes DNS records. It does not currently:
+
+- Delete the worker entity from ConfigHub (intentional — preserves audit trail and allows re-apply with the same worker)
+- Clean up orphaned EBS volumes (shouldn't happen with instance-store termination, but not verified)
+
+### Other limitations
+
+- **Single availability zone** — clusters are provisioned in a single AZ (the subnet's AZ). No HA.
+- **No persistent storage** — EBS root volume is deleted on termination. These are ephemeral demo clusters.
+- **Worker image pinning** — the cub-worker image is hardcoded to `v0.1.12`. Future: make it configurable in the spec.
+- **No Import** — the Import bridge operation is not implemented. Existing EC2 instances cannot be adopted as VMClusters.
+- **TTL / auto-sleep** — no automatic expiry or instance scheduling. Clusters run until explicitly destroyed.
+- **Boot time** — clusters take ~2 minutes to boot. Most of the time is k3s startup and cert-manager deployment.
+
 ## Building from source
 
 ```bash
