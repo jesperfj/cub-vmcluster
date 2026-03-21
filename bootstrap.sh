@@ -253,8 +253,8 @@ WORKER_OUTPUT=$(cub worker get "$WORKER_SLUG" --space "$WORKER_SPACE" --json --i
     die "Failed to get worker credentials: $WORKER_OUTPUT"
 }
 
-WORKER_ID=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('BridgeWorkerID',''))")
-WORKER_SECRET=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Secret',''))")
+WORKER_ID=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); w=d.get('BridgeWorker',d); print(w.get('BridgeWorkerID',''))")
+WORKER_SECRET=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); w=d.get('BridgeWorker',d); print(w.get('Secret',''))")
 
 if [[ -z "$WORKER_ID" || -z "$WORKER_SECRET" ]]; then
     die "Failed to parse worker credentials from: $WORKER_OUTPUT"
