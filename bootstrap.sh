@@ -231,32 +231,26 @@ echo ""
 
 # List spaces
 log_info "Fetching spaces..."
-SPACE_LIST=$(cub space list --output json 2>/dev/null | python3 -c "
-import sys, json
-spaces = json.load(sys.stdin)
-for s in spaces:
-    print(s.get('Slug', ''))
-" 2>/dev/null || echo "")
+SPACE_LIST=$(cub space list --jq '.[].Space.Slug' 2>/dev/null || echo "")
 
 WORKER_SPACE=""
 if [[ -n "$SPACE_LIST" ]]; then
     lines_to_array SPACE_OPTIONS "$SPACE_LIST"
     pick_from_list WORKER_SPACE "Which space should the vmcluster worker belong to?" "${SPACE_OPTIONS[@]}"
 else
-    prompt WORKER_SPACE "Space slug for the vmcluster worker"
+    prompt WORKER_SPACE "Space slug for the vmcluster worker" "default"
 fi
 
 prompt WORKER_SLUG "Worker slug" "vmcluster-controller"
 
 log_info "Creating worker '$WORKER_SLUG' in space '$WORKER_SPACE'..."
-WORKER_OUTPUT=$(cub worker create "$WORKER_SLUG" --space "$WORKER_SPACE" --output json 2>&1) || {
-    # Worker might already exist
-    if echo "$WORKER_OUTPUT" | grep -qi "already exists"; then
-        log_warn "Worker '$WORKER_SLUG' already exists."
-        echo "  If you need the credentials, delete and recreate it."
-        die "Cannot retrieve secret for existing worker."
-    fi
-    die "Failed to create worker: $WORKER_OUTPUT"
+cub worker create "$WORKER_SLUG" --space "$WORKER_SPACE" --allow-exists 2>&1 || {
+    die "Failed to create worker"
+}
+
+log_info "Fetching worker credentials..."
+WORKER_OUTPUT=$(cub worker get "$WORKER_SLUG" --space "$WORKER_SPACE" --json --include-secret 2>&1) || {
+    die "Failed to get worker credentials: $WORKER_OUTPUT"
 }
 
 WORKER_ID=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('BridgeWorkerID',''))")
