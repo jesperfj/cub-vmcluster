@@ -2,32 +2,98 @@
 set -euo pipefail
 
 # =============================================================================
-# vmctl — utility for interacting with vmcluster instances
+# vmctl — manage vmcluster infrastructure and clusters
 # =============================================================================
-#
-# Usage:
-#   ./vmctl kubeconfig <cluster-name>     Get kubeconfig (server rewritten to public IP)
-#   ./vmctl shell <cluster-name>          Open an SSM shell session
-#   ./vmctl exec <cluster-name> -- <cmd>  Run a command via SSM
-#   ./vmctl list                          List running vmcluster instances
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
+ENV_FILE="$SCRIPT_DIR/.env"
+
+# Source .env if it exists
+if [[ -f "$ENV_FILE" ]]; then
     set -a
-    source "$SCRIPT_DIR/.env"
+    source "$ENV_FILE"
     set +a
 fi
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-2}}"
+PREFIX="vmcluster"
 
+# --- Colors and helpers ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+BOLD='\033[1m'
 NC='\033[0m'
 
-die() { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
+log_info()    { echo -e "${BLUE}▸${NC} $*"; }
+log_success() { echo -e "${GREEN}✓${NC} $*"; }
+log_warn()    { echo -e "${YELLOW}⚠${NC} $*"; }
+log_error()   { echo -e "${RED}✗${NC} $*" >&2; }
+die()         { log_error "$@"; exit 1; }
 
-# Resolve cluster name to instance ID and public IP
+prompt() {
+    local var="$1" prompt="$2" default="${3:-}"
+    if [[ -n "$default" ]]; then
+        echo -en "${BOLD}${prompt}${NC} [${default}]: "
+        read -r input
+        eval "$var=\"${input:-$default}\""
+    else
+        echo -en "${BOLD}${prompt}${NC}: "
+        read -r input
+        eval "$var=\"$input\""
+    fi
+}
+
+lines_to_array() {
+    local _arrname="$1" _input="$2"
+    local _i=0
+    eval "$_arrname=()"
+    while IFS= read -r _line; do
+        if [[ -n "$_line" ]]; then
+            eval "${_arrname}[${_i}]=\"\${_line}\""
+            _i=$((_i + 1))
+        fi
+    done <<< "$_input"
+}
+
+pick_from_list() {
+    local var="$1" prompt="$2"
+    shift 2
+    local options=("$@")
+    if [[ ${#options[@]} -eq 0 ]]; then return 1; fi
+    echo ""
+    echo -e "${BOLD}${prompt}${NC}"
+    local i=1
+    for opt in "${options[@]}"; do
+        echo "  $i) $opt"
+        i=$((i + 1))
+    done
+    echo ""
+    echo -en "  ${BOLD}Choose${NC} [1]: "
+    read -r choice
+    choice="${choice:-1}"
+    if [[ "$choice" -lt 1 || "$choice" -gt ${#options[@]} ]] 2>/dev/null; then
+        die "Invalid choice"
+    fi
+    eval "$var=\"${options[$((choice-1))]}\""
+}
+
+confirm() {
+    local prompt="$1"
+    echo -en "${YELLOW}$prompt [y/N]:${NC} "
+    read -r response
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+require_env() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        die "No .env file found. Run './vmctl init' first."
+    fi
+}
+
+# --- Instance helpers ---
+
 resolve_instance() {
     local cluster_name="$1"
     local result
@@ -37,29 +103,23 @@ resolve_instance() {
             "Name=instance-state-name,Values=running" \
         --query "Reservations[].Instances[].[InstanceId,PublicIpAddress]" \
         --output text | head -1)
-
     if [[ -z "$result" ]]; then
         die "No running instance found for cluster '$cluster_name'"
     fi
-
     INSTANCE_ID=$(echo "$result" | awk '{print $1}')
     PUBLIC_IP=$(echo "$result" | awk '{print $2}')
 }
 
-# Run a command on the instance via SSM and print the output
 ssm_exec() {
     local instance_id="$1"
     shift
     local cmd="$*"
-
     local cmd_id
     cmd_id=$(aws ssm send-command --region "$REGION" \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
         --parameters "commands=[\"$cmd\"]" \
         --query "Command.CommandId" --output text)
-
-    # Poll for completion
     local status="InProgress"
     while [[ "$status" == "InProgress" || "$status" == "Pending" ]]; do
         sleep 1
@@ -68,71 +128,637 @@ ssm_exec() {
             --instance-id "$instance_id" \
             --query "Status" --output text 2>/dev/null || echo "InProgress")
     done
-
-    # Get output
     local output
     output=$(aws ssm get-command-invocation --region "$REGION" \
         --command-id "$cmd_id" \
         --instance-id "$instance_id" \
         --query "StandardOutputContent" --output text)
-
     local err_output
     err_output=$(aws ssm get-command-invocation --region "$REGION" \
         --command-id "$cmd_id" \
         --instance-id "$instance_id" \
         --query "StandardErrorContent" --output text)
-
-    if [[ -n "$output" ]]; then
-        echo "$output"
-    fi
-    if [[ -n "$err_output" ]]; then
-        echo "$err_output" >&2
-    fi
-
-    if [[ "$status" != "Success" ]]; then
-        return 1
-    fi
+    if [[ -n "$output" ]]; then echo "$output"; fi
+    if [[ -n "$err_output" ]]; then echo "$err_output" >&2; fi
+    if [[ "$status" != "Success" ]]; then return 1; fi
 }
 
-# --- Commands ---
+# =============================================================================
+# COMMANDS
+# =============================================================================
 
-cmd_kubeconfig() {
-    local cluster_name="${1:?Usage: vmctl kubeconfig <cluster-name>}"
-    resolve_instance "$cluster_name"
+# --- init ---
 
-    local kubeconfig
-    kubeconfig=$(ssm_exec "$INSTANCE_ID" "cat /etc/rancher/k3s/k3s.yaml")
-
-    # Rewrite server URL from 127.0.0.1 to public IP
-    echo "$kubeconfig" | sed "s|https://127.0.0.1:6443|https://${PUBLIC_IP}:6443|g"
-}
-
-cmd_shell() {
-    local cluster_name="${1:?Usage: vmctl shell <cluster-name>}"
-    resolve_instance "$cluster_name"
-
-    echo -e "${BLUE}▸${NC} Opening shell to $cluster_name ($INSTANCE_ID)"
-    aws ssm start-session --region "$REGION" --target "$INSTANCE_ID"
-}
-
-cmd_exec() {
-    local cluster_name="${1:?Usage: vmctl exec <cluster-name> -- <command>}"
-    shift
-
-    # Skip the -- separator if present
-    if [[ "${1:-}" == "--" ]]; then
-        shift
+cmd_init() {
+    local skip_infra=false
+    if [[ "${1:-}" == "--skip-infra" ]]; then
+        skip_infra=true
     fi
 
-    if [[ $# -eq 0 ]]; then
-        die "Usage: vmctl exec <cluster-name> -- <command>"
+    echo ""
+    echo -e "${BOLD}vmctl init${NC}"
+    echo "Set up AWS infrastructure and ConfigHub worker for vmcluster."
+    echo ""
+
+    # --- Prerequisites ---
+    command -v aws >/dev/null 2>&1 || die "AWS CLI not found. Install it first."
+    command -v cub >/dev/null 2>&1 || die "cub CLI not found. Install it first: https://docs.confighub.com/cli"
+
+    # --- AWS profile ---
+    if [[ -z "${AWS_PROFILE:-}" ]]; then
+        log_info "Discovering AWS profiles..."
+        PROFILE_LIST=$(grep '^\[profile ' ~/.aws/config 2>/dev/null | sed 's/\[profile \(.*\)\]/\1/' || echo "")
+        if [[ -n "$PROFILE_LIST" ]]; then
+            lines_to_array PROFILE_OPTIONS "$PROFILE_LIST"
+            PROFILE_OPTIONS[${#PROFILE_OPTIONS[@]}]="default"
+            pick_from_list PROFILE_CHOICE "Select an AWS profile:" "${PROFILE_OPTIONS[@]}"
+            if [[ "$PROFILE_CHOICE" != "default" ]]; then
+                export AWS_PROFILE="$PROFILE_CHOICE"
+            fi
+        fi
+    fi
+    if [[ -n "${AWS_PROFILE:-}" ]]; then
+        log_info "Using AWS profile: $AWS_PROFILE"
     fi
 
-    resolve_instance "$cluster_name"
-    ssm_exec "$INSTANCE_ID" "$*"
+    # --- AWS auth ---
+    log_info "Checking AWS credentials..."
+    AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || {
+        if [[ -n "${AWS_PROFILE:-}" ]]; then
+            log_info "Profile $AWS_PROFILE needs login, attempting SSO login..."
+            aws sso login --profile "$AWS_PROFILE"
+            AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || \
+                die "Still not authenticated after SSO login."
+        else
+            die "Not authenticated to AWS. Run 'aws configure' or 'aws sso login' first."
+        fi
+    }
+    AWS_REGION=$(aws configure get region 2>/dev/null || echo "")
+    log_success "AWS account: $AWS_ACCOUNT"
+
+    # Detect AWS auth method for Docker
+    AWS_AUTH_METHOD=""
+    if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]]; then
+        AWS_AUTH_METHOD="env"
+    elif [[ -n "${AWS_PROFILE:-}" ]]; then
+        AWS_AUTH_METHOD="profile"
+    else
+        AWS_AUTH_METHOD="default"
+    fi
+
+    if [[ -z "$AWS_REGION" ]]; then
+        prompt AWS_REGION "AWS region" "us-east-2"
+    fi
+    REGION="$AWS_REGION"
+    log_success "Region: $AWS_REGION"
+
+    # --- ConfigHub auth ---
+    log_info "Checking ConfigHub credentials..."
+    cub space list >/dev/null 2>&1 || die "Not authenticated to ConfigHub. Run 'cub auth login' first."
+    CUB_SERVER=$(grep -A5 'current-context' ~/.confighub/config.yaml 2>/dev/null | grep 'server' | head -1 | awk '{print $2}' || echo "")
+    if [[ -z "$CUB_SERVER" ]]; then
+        prompt CUB_SERVER "ConfigHub server URL" "https://hub.confighub.com"
+    fi
+    log_success "ConfigHub: $CUB_SERVER"
+
+    # --- Infrastructure setup ---
+    if [[ "$skip_infra" == false ]]; then
+        init_infra
+    else
+        log_info "Skipping infrastructure setup (--skip-infra)"
+    fi
+
+    # --- Discover VPCs ---
+    log_info "Discovering VPCs in $AWS_REGION..."
+    VPC_LIST=$(aws ec2 describe-vpcs --region "$AWS_REGION" \
+        --query "Vpcs[].[VpcId,CidrBlock,Tags[?Key=='Name']|[0].Value || 'unnamed']" \
+        --output text | while read -r id cidr name; do echo "$id ($name, $cidr)"; done)
+    if [[ -z "$VPC_LIST" ]]; then
+        die "No VPCs found in $AWS_REGION."
+    fi
+    lines_to_array VPC_OPTIONS "$VPC_LIST"
+    pick_from_list VPC_CHOICE "Select a VPC:" "${VPC_OPTIONS[@]}"
+    VPC_ID=$(echo "$VPC_CHOICE" | cut -d' ' -f1)
+    log_success "VPC: $VPC_ID"
+
+    # --- Discover subnets ---
+    log_info "Discovering subnets in $VPC_ID..."
+    SUBNET_LIST=$(aws ec2 describe-subnets --region "$AWS_REGION" \
+        --filters "Name=vpc-id,Values=$VPC_ID" \
+        --query "Subnets[].[SubnetId,AvailabilityZone,CidrBlock,MapPublicIpOnLaunch,Tags[?Key=='Name']|[0].Value || 'unnamed']" \
+        --output text | while read -r id az cidr public name; do
+            label="$id ($name, $az, $cidr"
+            if [[ "$public" == "True" ]]; then label="$label, public"; fi
+            echo "$label)"
+        done)
+    if [[ -z "$SUBNET_LIST" ]]; then
+        die "No subnets found in VPC $VPC_ID."
+    fi
+    lines_to_array SUBNET_OPTIONS "$SUBNET_LIST"
+    pick_from_list SUBNET_CHOICE "Select a subnet (public recommended):" "${SUBNET_OPTIONS[@]}"
+    SUBNET_ID=$(echo "$SUBNET_CHOICE" | cut -d' ' -f1)
+    log_success "Subnet: $SUBNET_ID"
+
+    # --- Discover Route53 zones ---
+    log_info "Discovering Route53 hosted zones..."
+    ZONE_LIST=$(aws route53 list-hosted-zones \
+        --query "HostedZones[?Config.PrivateZone==\`false\`].[Id,Name]" \
+        --output text | while read -r id name; do
+            id="${id#/hostedzone/}"
+            echo "$id ($name)"
+        done)
+    ZONE_ID=""
+    if [[ -n "$ZONE_LIST" ]]; then
+        lines_to_array ZONE_OPTIONS "$ZONE_LIST"
+        ZONE_OPTIONS[${#ZONE_OPTIONS[@]}]="Skip — no DNS"
+        pick_from_list ZONE_CHOICE "Select a Route53 hosted zone for DNS:" "${ZONE_OPTIONS[@]}"
+        if [[ "$ZONE_CHOICE" != "Skip — no DNS" ]]; then
+            ZONE_ID=$(echo "$ZONE_CHOICE" | cut -d' ' -f1)
+            log_success "Route53 zone: $ZONE_ID"
+        else
+            log_info "Skipping DNS"
+        fi
+    else
+        log_warn "No Route53 hosted zones found. DNS will not be configured."
+    fi
+
+    # --- Check instance profile ---
+    INSTANCE_PROFILE="vmcluster-instance"
+    log_info "Checking IAM instance profile '$INSTANCE_PROFILE'..."
+    if aws iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE" &>/dev/null; then
+        log_success "Instance profile exists"
+    else
+        die "Instance profile '$INSTANCE_PROFILE' not found. Run './vmctl init' without --skip-infra."
+    fi
+
+    # --- ConfigHub worker ---
+    echo ""
+    echo -e "${BOLD}ConfigHub worker setup${NC}"
+    echo ""
+    log_info "Fetching spaces..."
+    SPACE_LIST=$(cub space list --jq '.[].Space.Slug' 2>/dev/null || echo "")
+    WORKER_SPACE=""
+    if [[ -n "$SPACE_LIST" ]]; then
+        lines_to_array SPACE_OPTIONS "$SPACE_LIST"
+        pick_from_list WORKER_SPACE "Which space should the vmcluster worker belong to?" "${SPACE_OPTIONS[@]}"
+    else
+        prompt WORKER_SPACE "Space slug for the vmcluster worker" "default"
+    fi
+
+    prompt WORKER_SLUG "Worker slug" "vmcluster-controller"
+
+    log_info "Creating worker '$WORKER_SLUG' in space '$WORKER_SPACE'..."
+    cub worker create "$WORKER_SLUG" --space "$WORKER_SPACE" --allow-exists 2>&1 || {
+        die "Failed to create worker"
+    }
+
+    log_info "Fetching worker credentials..."
+    WORKER_OUTPUT=$(cub worker get "$WORKER_SLUG" --space "$WORKER_SPACE" --json --include-secret 2>&1) || {
+        die "Failed to get worker credentials: $WORKER_OUTPUT"
+    }
+    WORKER_ID=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); w=d.get('BridgeWorker',d); print(w.get('BridgeWorkerID',''))")
+    WORKER_SECRET=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); w=d.get('BridgeWorker',d); print(w.get('Secret',''))")
+    if [[ -z "$WORKER_ID" || -z "$WORKER_SECRET" ]]; then
+        die "Failed to parse worker credentials"
+    fi
+    log_success "Worker: $WORKER_SLUG ($WORKER_ID)"
+
+    # --- Write .env ---
+    cat > "$ENV_FILE" <<EOF
+# vmctl configuration
+# Generated by vmctl init on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+CONFIGHUB_URL=$CUB_SERVER
+CONFIGHUB_WORKER_ID=$WORKER_ID
+CONFIGHUB_WORKER_SECRET=$WORKER_SECRET
+SUBNET_ID=$SUBNET_ID
+INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE
+ROUTE53_HOSTED_ZONE_ID=$ZONE_ID
+AWS_REGION=$AWS_REGION
+EOF
+
+    # Docker AWS auth
+    DOCKER_CMD="docker run --rm --env-file .env"
+    case "$AWS_AUTH_METHOD" in
+        env)
+            cat >> "$ENV_FILE" <<EOF
+AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+EOF
+            if [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then
+                echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" >> "$ENV_FILE"
+            fi
+            ;;
+        profile)
+            echo "AWS_PROFILE=$AWS_PROFILE" >> "$ENV_FILE"
+            DOCKER_CMD="$DOCKER_CMD -v \$HOME/.aws:/root/.aws:ro"
+            ;;
+        *)
+            DOCKER_CMD="$DOCKER_CMD -v \$HOME/.aws:/root/.aws:ro"
+            ;;
+    esac
+    DOCKER_CMD="$DOCKER_CMD ghcr.io/jesperfj/cub-vmcluster:latest"
+
+    log_success "Configuration written to .env"
+
+    # --- Create first VMCluster unit ---
+    echo ""
+    echo -e "${BOLD}First cluster setup${NC}"
+    echo ""
+    prompt CLUSTER_NAME "Cluster name" "cluster1"
+    prompt CLUSTER_INSTANCE_TYPE "Instance type" "t4g.small"
+    prompt CLUSTER_K3S_VERSION "k3s version" "v1.35.2+k3s1"
+
+    CLUSTER_DOMAIN=""
+    if [[ -n "$ZONE_ID" ]]; then
+        ZONE_NAME=$(aws route53 get-hosted-zone --id "$ZONE_ID" --query "HostedZone.Name" --output text | sed 's/\.$//')
+        prompt CLUSTER_DOMAIN "Cluster domain" "${CLUSTER_NAME}.${ZONE_NAME}"
+    fi
+
+    CLUSTER_WORKER_SLUG="${CLUSTER_NAME}-worker"
+    VMCLUSTER_TARGET=$(cub target list --space "$WORKER_SPACE" --jq ".[].Slug" 2>/dev/null | grep -i vmcluster | head -1 || echo "")
+
+    CLUSTER_YAML="apiVersion: demo.confighub.com/v1alpha1
+kind: VMCluster
+metadata:
+  name: ${CLUSTER_NAME}
+spec:
+  instanceType: ${CLUSTER_INSTANCE_TYPE}
+  region: ${AWS_REGION}
+  diskSizeGB: 30
+  k3sVersion: ${CLUSTER_K3S_VERSION}
+  ingress:
+    enabled: $(if [[ -n "$CLUSTER_DOMAIN" ]]; then echo "true"; else echo "false"; fi)
+    domain: ${CLUSTER_DOMAIN}
+    tls:
+      enabled: $(if [[ -n "$CLUSTER_DOMAIN" ]]; then echo "true"; else echo "false"; fi)
+      email: ops@confighub.com
+  worker:
+    confighubURL: ${CUB_SERVER}
+    slug: ${CLUSTER_WORKER_SLUG}
+    spaceSlug: ${WORKER_SPACE}
+    providerTypes:
+      - Kubernetes
+  installVMClusterWorker: true"
+
+    log_info "Creating unit '${CLUSTER_NAME}' in space '${WORKER_SPACE}'..."
+    TARGET_FLAG=""
+    if [[ -n "$VMCLUSTER_TARGET" ]]; then
+        TARGET_FLAG="--target $VMCLUSTER_TARGET"
+    fi
+    echo "$CLUSTER_YAML" | cub unit create --space "$WORKER_SPACE" "$CLUSTER_NAME" - \
+        $TARGET_FLAG --allow-exists 2>&1 || {
+        log_warn "Failed to create unit. You can create it manually in the ConfigHub UI."
+    }
+    log_success "Unit created"
+
+    # --- Summary ---
+    EXPECTED_TARGET="${WORKER_SLUG}-vmcluster-kubernetes-yaml-default"
+    echo ""
+    echo "============================================"
+    echo -e "  ${GREEN}${BOLD}Init complete${NC}"
+    echo "============================================"
+    echo ""
+    echo "  Worker:   $WORKER_SLUG ($WORKER_ID)"
+    echo "  Space:    $WORKER_SPACE"
+    echo "  Subnet:   $SUBNET_ID"
+    echo "  Profile:  $INSTANCE_PROFILE"
+    if [[ -n "$ZONE_ID" ]]; then echo "  DNS Zone: $ZONE_ID"; fi
+    echo ""
+    echo "  Next steps:"
+    echo ""
+    echo "  1. Start the worker:"
+    echo ""
+    echo "     $DOCKER_CMD"
+    echo ""
+    echo "  2. Open ConfigHub and verify the worker is connected"
+    echo "  3. Assign the '${CLUSTER_NAME}' unit to the target:"
+    echo "     ${EXPECTED_TARGET}"
+    echo "  4. Apply the unit to provision your first cluster"
+    echo ""
 }
+
+# --- Infrastructure setup (called from init) ---
+
+init_infra() {
+    log_info "Setting up AWS infrastructure..."
+
+    # VPC
+    local vpc_id
+    vpc_id=$(aws ec2 describe-vpcs --region "$AWS_REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-vpc" \
+        --query "Vpcs[0].VpcId" --output text)
+    if [[ "$vpc_id" == "None" ]]; then
+        log_info "Creating VPC..."
+        vpc_id=$(aws ec2 create-vpc --region "$AWS_REGION" \
+            --cidr-block 10.99.0.0/16 \
+            --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PREFIX}-vpc}]" \
+            --query "Vpc.VpcId" --output text)
+        aws ec2 modify-vpc-attribute --region "$AWS_REGION" --vpc-id "$vpc_id" --enable-dns-hostnames
+        aws ec2 modify-vpc-attribute --region "$AWS_REGION" --vpc-id "$vpc_id" --enable-dns-support
+        log_success "VPC: $vpc_id"
+    else
+        log_success "VPC exists: $vpc_id"
+    fi
+
+    # Internet Gateway
+    local igw_id
+    igw_id=$(aws ec2 describe-internet-gateways --region "$AWS_REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-igw" \
+        --query "InternetGateways[0].InternetGatewayId" --output text)
+    if [[ "$igw_id" == "None" ]]; then
+        log_info "Creating internet gateway..."
+        igw_id=$(aws ec2 create-internet-gateway --region "$AWS_REGION" \
+            --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=${PREFIX}-igw}]" \
+            --query "InternetGateway.InternetGatewayId" --output text)
+        aws ec2 attach-internet-gateway --region "$AWS_REGION" --internet-gateway-id "$igw_id" --vpc-id "$vpc_id"
+        log_success "IGW: $igw_id"
+    else
+        log_success "IGW exists: $igw_id"
+    fi
+
+    # Subnet
+    local subnet_id
+    subnet_id=$(aws ec2 describe-subnets --region "$AWS_REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-public" "Name=vpc-id,Values=$vpc_id" \
+        --query "Subnets[0].SubnetId" --output text)
+    if [[ "$subnet_id" == "None" ]]; then
+        log_info "Creating public subnet..."
+        subnet_id=$(aws ec2 create-subnet --region "$AWS_REGION" \
+            --vpc-id "$vpc_id" \
+            --cidr-block 10.99.1.0/24 \
+            --availability-zone "${AWS_REGION}a" \
+            --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PREFIX}-public}]" \
+            --query "Subnet.SubnetId" --output text)
+        aws ec2 modify-subnet-attribute --region "$AWS_REGION" --subnet-id "$subnet_id" --map-public-ip-on-launch
+        log_success "Subnet: $subnet_id"
+    else
+        log_success "Subnet exists: $subnet_id"
+    fi
+
+    # Route Table
+    local rt_id
+    rt_id=$(aws ec2 describe-route-tables --region "$AWS_REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-public-rt" "Name=vpc-id,Values=$vpc_id" \
+        --query "RouteTables[0].RouteTableId" --output text)
+    if [[ "$rt_id" == "None" ]]; then
+        log_info "Creating route table..."
+        rt_id=$(aws ec2 create-route-table --region "$AWS_REGION" \
+            --vpc-id "$vpc_id" \
+            --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${PREFIX}-public-rt}]" \
+            --query "RouteTable.RouteTableId" --output text)
+        aws ec2 create-route --region "$AWS_REGION" --route-table-id "$rt_id" --destination-cidr-block 0.0.0.0/0 --gateway-id "$igw_id" > /dev/null
+        aws ec2 associate-route-table --region "$AWS_REGION" --route-table-id "$rt_id" --subnet-id "$subnet_id" > /dev/null
+        log_success "Route table: $rt_id"
+    else
+        log_success "Route table exists: $rt_id"
+    fi
+
+    # IAM Instance Role
+    local instance_role="${PREFIX}-instance"
+    local aws_account
+    aws_account=$(aws sts get-caller-identity --query Account --output text)
+    if aws iam get-role --role-name "$instance_role" &>/dev/null; then
+        log_success "Instance role exists: $instance_role"
+    else
+        log_info "Creating instance role: $instance_role"
+        aws iam create-role \
+            --role-name "$instance_role" \
+            --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
+            --description "EC2 instance role for VMCluster nodes (SSM + provisioning)" > /dev/null
+        log_success "Instance role: $instance_role"
+    fi
+
+    aws iam attach-role-policy \
+        --role-name "$instance_role" \
+        --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" 2>/dev/null || true
+
+    aws iam put-role-policy \
+        --role-name "$instance_role" \
+        --policy-name "${PREFIX}-instance-policy" \
+        --policy-document "$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "EC2", "Effect": "Allow", "Action": "ec2:*", "Resource": "*",
+     "Condition": {"StringEquals": {"aws:RequestedRegion": ["$AWS_REGION"]}}},
+    {"Sid": "Route53", "Effect": "Allow",
+     "Action": ["route53:ChangeResourceRecordSets", "route53:GetHostedZone", "route53:ListResourceRecordSets"],
+     "Resource": "arn:aws:route53:::hostedzone/*"},
+    {"Sid": "IAMPassRole", "Effect": "Allow", "Action": "iam:PassRole",
+     "Resource": "arn:aws:iam::${aws_account}:role/${PREFIX}-instance"},
+    {"Sid": "Tagging", "Effect": "Allow", "Action": "ec2:CreateTags",
+     "Resource": "arn:aws:ec2:*:*:instance/*"},
+    {"Sid": "SSMCommands", "Effect": "Allow",
+     "Action": ["ssm:SendCommand", "ssm:GetCommandInvocation"], "Resource": "*"}
+  ]
+}
+EOF
+    )"
+
+    # Instance Profile
+    local instance_profile="${PREFIX}-instance"
+    if aws iam get-instance-profile --instance-profile-name "$instance_profile" &>/dev/null; then
+        log_success "Instance profile exists: $instance_profile"
+    else
+        log_info "Creating instance profile: $instance_profile"
+        aws iam create-instance-profile --instance-profile-name "$instance_profile" > /dev/null
+        aws iam add-role-to-instance-profile \
+            --instance-profile-name "$instance_profile" \
+            --role-name "$instance_role"
+        log_info "Waiting 10s for instance profile propagation..."
+        sleep 10
+        log_success "Instance profile: $instance_profile"
+    fi
+
+    log_success "Infrastructure ready"
+}
+
+# --- teardown ---
+
+cmd_teardown() {
+    local force="${1:-}"
+    require_env
+
+    # Check for running instances
+    local instance_ids
+    instance_ids=$(aws ec2 describe-instances --region "$REGION" \
+        --filters "Name=tag:confighub:managed-by,Values=cub-vmcluster" \
+                  "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+        --query "Reservations[].Instances[].InstanceId" --output text)
+    if [[ -n "$instance_ids" ]]; then
+        if [[ "$force" == "--force" ]]; then
+            log_info "Terminating instances: $instance_ids"
+            aws ec2 terminate-instances --region "$REGION" --instance-ids $instance_ids > /dev/null
+            log_info "Waiting for instances to terminate..."
+            aws ec2 wait instance-terminated --region "$REGION" --instance-ids $instance_ids
+            log_success "All instances terminated"
+        else
+            log_warn "Instances still running: $instance_ids"
+            log_info "Use './vmctl teardown --force' to terminate all instances and tear down everything"
+            confirm "Continue teardown without terminating instances?" || exit 1
+        fi
+    fi
+
+    # Instance profile
+    local instance_profile="${PREFIX}-instance"
+    local instance_role="${PREFIX}-instance"
+    if aws iam get-instance-profile --instance-profile-name "$instance_profile" &>/dev/null; then
+        aws iam remove-role-from-instance-profile \
+            --instance-profile-name "$instance_profile" --role-name "$instance_role" 2>/dev/null || true
+        aws iam delete-instance-profile --instance-profile-name "$instance_profile"
+        log_success "Deleted instance profile"
+    fi
+
+    # Instance role
+    if aws iam get-role --role-name "$instance_role" &>/dev/null; then
+        local managed_policies
+        managed_policies=$(aws iam list-attached-role-policies --role-name "$instance_role" \
+            --query "AttachedPolicies[].PolicyArn" --output text)
+        for policy_arn in $managed_policies; do
+            aws iam detach-role-policy --role-name "$instance_role" --policy-arn "$policy_arn" 2>/dev/null || true
+        done
+        local inline_policies
+        inline_policies=$(aws iam list-role-policies --role-name "$instance_role" \
+            --query "PolicyNames[]" --output text)
+        for policy_name in $inline_policies; do
+            aws iam delete-role-policy --role-name "$instance_role" --policy-name "$policy_name" 2>/dev/null || true
+        done
+        aws iam delete-role --role-name "$instance_role"
+        log_success "Deleted instance role"
+    fi
+
+    # Legacy provisioner role
+    local provisioner_role="${PREFIX}-provisioner"
+    if aws iam get-role --role-name "$provisioner_role" &>/dev/null; then
+        local prov_inline
+        prov_inline=$(aws iam list-role-policies --role-name "$provisioner_role" \
+            --query "PolicyNames[]" --output text)
+        for pn in $prov_inline; do
+            aws iam delete-role-policy --role-name "$provisioner_role" --policy-name "$pn" 2>/dev/null || true
+        done
+        aws iam delete-role --role-name "$provisioner_role"
+        log_success "Deleted legacy provisioner role"
+    fi
+
+    # Security groups
+    local sg_ids
+    sg_ids=$(aws ec2 describe-security-groups --region "$REGION" \
+        --filters "Name=tag:confighub:managed-by,Values=cub-vmcluster" \
+        --query "SecurityGroups[].GroupId" --output text)
+    for sg_id in $sg_ids; do
+        aws ec2 delete-security-group --region "$REGION" --group-id "$sg_id" 2>/dev/null && \
+            log_success "Deleted security group: $sg_id" || \
+            log_warn "Could not delete security group $sg_id (may have dependencies)"
+    done
+
+    # Route table
+    local rt_id
+    rt_id=$(aws ec2 describe-route-tables --region "$REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-public-rt" \
+        --query "RouteTables[0].RouteTableId" --output text)
+    if [[ "$rt_id" != "None" ]]; then
+        local assoc_ids
+        assoc_ids=$(aws ec2 describe-route-tables --region "$REGION" --route-table-ids "$rt_id" \
+            --query "RouteTables[0].Associations[?!Main].RouteTableAssociationId" --output text)
+        for assoc_id in $assoc_ids; do
+            aws ec2 disassociate-route-table --region "$REGION" --association-id "$assoc_id" 2>/dev/null || true
+        done
+        aws ec2 delete-route-table --region "$REGION" --route-table-id "$rt_id"
+        log_success "Deleted route table"
+    fi
+
+    # Subnet
+    local subnet_id
+    subnet_id=$(aws ec2 describe-subnets --region "$REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-public" \
+        --query "Subnets[0].SubnetId" --output text)
+    if [[ "$subnet_id" != "None" ]]; then
+        aws ec2 delete-subnet --region "$REGION" --subnet-id "$subnet_id"
+        log_success "Deleted subnet"
+    fi
+
+    # Internet gateway
+    local igw_id
+    igw_id=$(aws ec2 describe-internet-gateways --region "$REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-igw" \
+        --query "InternetGateways[0].InternetGatewayId" --output text)
+    if [[ "$igw_id" != "None" ]]; then
+        local vpc_id
+        vpc_id=$(aws ec2 describe-internet-gateways --region "$REGION" --internet-gateway-ids "$igw_id" \
+            --query "InternetGateways[0].Attachments[0].VpcId" --output text)
+        if [[ "$vpc_id" != "None" ]]; then
+            aws ec2 detach-internet-gateway --region "$REGION" --internet-gateway-id "$igw_id" --vpc-id "$vpc_id"
+        fi
+        aws ec2 delete-internet-gateway --region "$REGION" --internet-gateway-id "$igw_id"
+        log_success "Deleted internet gateway"
+    fi
+
+    # VPC
+    local vpc_id
+    vpc_id=$(aws ec2 describe-vpcs --region "$REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-vpc" \
+        --query "Vpcs[0].VpcId" --output text)
+    if [[ "$vpc_id" != "None" ]]; then
+        aws ec2 delete-vpc --region "$REGION" --vpc-id "$vpc_id"
+        log_success "Deleted VPC"
+    fi
+
+    log_success "Teardown complete"
+}
+
+# --- status ---
+
+cmd_status() {
+    require_env
+
+    echo ""
+    log_info "Clusters"
+    aws ec2 describe-instances --region "$REGION" \
+        --filters \
+            "Name=tag:confighub:managed-by,Values=cub-vmcluster" \
+            "Name=instance-state-name,Values=running" \
+        --query "Reservations[].Instances[].[Tags[?Key=='confighub:cluster-name']|[0].Value,InstanceId,InstanceType,PublicIpAddress,Tags[?Key=='confighub:status']|[0].Value]" \
+        --output table
+
+    log_info "Infrastructure"
+    local vpc_id
+    vpc_id=$(aws ec2 describe-vpcs --region "$REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-vpc" \
+        --query "Vpcs[0].VpcId" --output text)
+    if [[ "$vpc_id" != "None" ]]; then
+        echo "    VPC: $vpc_id"
+    else
+        echo "    VPC: not found"
+    fi
+
+    local subnet_id
+    subnet_id=$(aws ec2 describe-subnets --region "$REGION" \
+        --filters "Name=tag:Name,Values=${PREFIX}-public" \
+        --query "Subnets[0].SubnetId" --output text)
+    if [[ "$subnet_id" != "None" ]]; then
+        echo "    Subnet: $subnet_id"
+    else
+        echo "    Subnet: not found"
+    fi
+
+    if aws iam get-instance-profile --instance-profile-name "${PREFIX}-instance" &>/dev/null; then
+        echo "    Instance profile: ${PREFIX}-instance"
+    else
+        echo "    Instance profile: not found"
+    fi
+
+    if [[ -n "${ROUTE53_HOSTED_ZONE_ID:-}" ]]; then
+        echo "    Route53 zone: ${ROUTE53_HOSTED_ZONE_ID}"
+        aws route53 list-resource-record-sets --hosted-zone-id "$ROUTE53_HOSTED_ZONE_ID" \
+            --query "ResourceRecordSets[?Type == 'A'].[Name,ResourceRecords[0].Value]" --output table 2>/dev/null || true
+    fi
+    echo ""
+}
+
+# --- Cluster access commands ---
 
 cmd_list() {
+    require_env
     aws ec2 describe-instances --region "$REGION" \
         --filters \
             "Name=tag:confighub:managed-by,Values=cub-vmcluster" \
@@ -141,22 +767,59 @@ cmd_list() {
         --output table
 }
 
-# --- Main ---
+cmd_kubeconfig() {
+    require_env
+    local cluster_name="${1:?Usage: vmctl kubeconfig <cluster-name>}"
+    resolve_instance "$cluster_name"
+    local kubeconfig
+    kubeconfig=$(ssm_exec "$INSTANCE_ID" "cat /etc/rancher/k3s/k3s.yaml")
+    echo "$kubeconfig" | sed "s|https://127.0.0.1:6443|https://${PUBLIC_IP}:6443|g"
+}
+
+cmd_shell() {
+    require_env
+    local cluster_name="${1:?Usage: vmctl shell <cluster-name>}"
+    resolve_instance "$cluster_name"
+    log_info "Opening shell to $cluster_name ($INSTANCE_ID)"
+    aws ssm start-session --region "$REGION" --target "$INSTANCE_ID"
+}
+
+cmd_exec() {
+    require_env
+    local cluster_name="${1:?Usage: vmctl exec <cluster-name> -- <command>}"
+    shift
+    if [[ "${1:-}" == "--" ]]; then shift; fi
+    if [[ $# -eq 0 ]]; then die "Usage: vmctl exec <cluster-name> -- <command>"; fi
+    resolve_instance "$cluster_name"
+    ssm_exec "$INSTANCE_ID" "$*"
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 usage() {
     echo "Usage: vmctl <command> [args]"
     echo ""
-    echo "Commands:"
-    echo "  kubeconfig <name>        Get kubeconfig for a cluster"
-    echo "  shell <name>             Open SSM shell to a cluster"
-    echo "  exec <name> -- <cmd>     Run command on a cluster"
-    echo "  list                     List running vmcluster instances"
+    echo "Setup:"
+    echo "  init [--skip-infra]        Set up AWS infra, ConfigHub worker, and first cluster"
+    echo "  teardown [--force]         Remove all AWS infrastructure"
+    echo "  status                     Show infrastructure and running clusters"
+    echo ""
+    echo "Cluster access:"
+    echo "  list                       List running clusters"
+    echo "  kubeconfig <name>          Get kubeconfig for a cluster"
+    echo "  shell <name>               Open SSM shell to a cluster"
+    echo "  exec <name> -- <cmd>       Run command on a cluster"
 }
 
 case "${1:-}" in
+    init)       shift; cmd_init "$@" ;;
+    teardown)   shift; cmd_teardown "$@" ;;
+    status)     cmd_status ;;
+    list)       cmd_list ;;
     kubeconfig) shift; cmd_kubeconfig "$@" ;;
     shell)      shift; cmd_shell "$@" ;;
     exec)       shift; cmd_exec "$@" ;;
-    list)       cmd_list ;;
     *)          usage ;;
 esac

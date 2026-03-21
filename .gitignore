@@ -2,4 +2,3 @@
 bin/
 cub-vmcluster
 worker.log
-infra/env.sh

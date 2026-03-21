@@ -8,51 +8,44 @@ No baked AMIs — clusters boot from stock Ubuntu and install everything on the 
 
 You need:
 - [cub CLI](https://docs.confighub.com/cli) authenticated to ConfigHub
-- AWS CLI authenticated to an AWS account
+- AWS CLI configured with at least one profile
 - Docker
 
-### 1. Set up AWS infrastructure
-
-The vmcluster worker needs a VPC with a public subnet and an IAM instance profile. If you already have these, skip to step 2.
+### 1. Initialize
 
 ```bash
-# Edit infra/env.sh with your account details
-cp infra/env.sh.example infra/env.sh
-vi infra/env.sh
-
-# Create VPC, subnet, IAM roles, and optionally a Route53 zone
-./infra/ops setup
+./vmctl init
 ```
 
-### 2. Bootstrap
+This interactive command:
+- Selects your AWS profile and authenticates (SSO login if needed)
+- Creates AWS infrastructure (VPC, subnet, IAM roles) if it doesn't exist
+- Discovers your VPCs, subnets, and Route53 zones
+- Creates a ConfigHub worker
+- Creates the first VMCluster unit
+- Writes a `.env` file with all configuration
 
-The bootstrap script discovers your AWS environment, creates a ConfigHub worker, and generates a `.env` file:
+If you already have a VPC and instance profile, skip infrastructure creation:
 
 ```bash
-./bootstrap.sh
+./vmctl init --skip-infra
 ```
 
-It will walk you through selecting a VPC, subnet, and Route53 zone, then create a worker in ConfigHub.
+### 2. Run the worker
 
-### 3. Run the worker
+The init output includes the exact Docker command. It looks like:
 
 ```bash
-docker run --rm --env-file .env ghcr.io/jesperfj/cub-vmcluster:main
+docker run --rm --env-file .env -v $HOME/.aws:/root/.aws:ro ghcr.io/jesperfj/cub-vmcluster:latest
 ```
 
-The worker connects to ConfigHub and is ready to receive VMCluster apply operations.
+### 3. Apply the cluster
 
-> **Note:** The Docker container needs AWS credentials. If using SSO or profiles, you may need to mount your credentials:
-> ```bash
-> docker run --rm --env-file .env \
->   -v ~/.aws:/root/.aws:ro \
->   -e AWS_PROFILE=your-profile \
->   ghcr.io/jesperfj/cub-vmcluster:main
-> ```
+Open ConfigHub, assign the VMCluster unit to the vmcluster target (shown in the init output), and hit Apply. Your cluster will be ready in about 2 minutes.
 
-### 4. Create a cluster
+### 4. Create more clusters
 
-Create a unit in ConfigHub with a VMCluster spec:
+Create additional VMCluster units in ConfigHub:
 
 ```yaml
 apiVersion: demo.confighub.com/v1alpha1
@@ -171,10 +164,8 @@ The bridge:
 
 ## Cluster access
 
-The `vmctl` utility provides quick access to running clusters via AWS SSM. It reads configuration from `.env` (created by `bootstrap.sh`).
-
 ```bash
-./vmctl list                              # List running vmcluster instances
+./vmctl list                              # List running clusters
 ./vmctl kubeconfig cluster1               # Get kubeconfig (server rewritten to public IP)
 ./vmctl shell cluster1                    # Open an interactive SSM shell
 ./vmctl exec cluster1 -- kubectl get pods -A  # Run a command remotely
@@ -192,11 +183,9 @@ No SSH keys or open ports required — access is via AWS Systems Manager.
 ## Infrastructure management
 
 ```bash
-./infra/ops aws-login              # Authenticate via AWS SSO
-./infra/ops setup                  # Create VPC, subnet, IAM (idempotent)
-./infra/ops status                 # Show current state
-./infra/ops teardown               # Remove infrastructure (warns about instances)
-./infra/ops teardown --force       # Terminate all instances and remove everything
+./vmctl status                     # Show infrastructure and running clusters
+./vmctl teardown                   # Remove AWS infrastructure (warns about instances)
+./vmctl teardown --force           # Terminate all instances and remove everything
 ```
 
 ## Limitations and future work
