@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 	"github.com/confighub/sdk/core/worker/api"
 	"gopkg.in/yaml.v3"
@@ -54,7 +55,30 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 
 	awsCtx := ctx.Context()
 
-	// Step 1: Terminate instance
+	// Step 1: Delete worker deployment so it disconnects cleanly from ConfigHub
+	if existing.InstanceID != "" {
+		_ = ctx.SendStatus(&api.ActionResult{
+			UnitID:            payload.UnitID,
+			SpaceID:           payload.SpaceID,
+			QueuedOperationID: payload.QueuedOperationID,
+			ActionResultBaseMeta: api.ActionResultMeta{
+				Action:    api.ActionDestroy,
+				Result:    api.ActionResultNone,
+				Status:    api.ActionStatusProgressing,
+				Message:   "Disconnecting worker",
+				StartedAt: startTime,
+			},
+		})
+
+		if err := b.deleteWorkerDeployment(awsCtx, existing.InstanceID, region); err != nil {
+			log.Printf("[WARN] Failed to delete worker deployment: %v", err)
+		} else {
+			// Give ConfigHub a moment to register the disconnect
+			time.Sleep(5 * time.Second)
+		}
+	}
+
+	// Step 2: Terminate instance
 	if existing.InstanceID != "" {
 		ec2c, err := b.ec2Client(awsCtx, region)
 		if err != nil {
@@ -77,7 +101,7 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 			log.Printf("[WARN] Timeout waiting for instance %s to terminate: %v", existing.InstanceID, err)
 		}
 
-		// Step 2: Delete security group (after instance terminated)
+		// Step 3: Delete security group (after instance terminated)
 		if existing.SecurityGroupID != "" {
 			log.Printf("[INFO] Deleting security group %s", existing.SecurityGroupID)
 			_, err = ec2c.DeleteSecurityGroup(awsCtx, &ec2.DeleteSecurityGroupInput{
@@ -89,7 +113,7 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 		}
 	}
 
-	// Step 3: Remove DNS records
+	// Step 4: Remove DNS records
 	if existing.DNSRecord != "" && existing.PublicIP != "" && b.hostedZoneID != "" {
 		log.Printf("[INFO] Removing DNS records for %s", existing.DNSRecord)
 		if err := b.deleteDNSRecord(awsCtx, existing.DNSRecord, existing.PublicIP); err != nil {
@@ -112,6 +136,46 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 		},
 		LiveData: []byte{},
 	})
+}
+
+// deleteWorkerDeployment deletes the cub-worker deployment via SSM so it disconnects
+// cleanly from ConfigHub before the instance is terminated.
+func (b *VMClusterBridge) deleteWorkerDeployment(ctx context.Context, instanceID, region string) error {
+	cfg, err := b.assumeRoleConfig(ctx)
+	if err != nil {
+		return err
+	}
+	ssmClient := ssm.NewFromConfig(cfg, func(o *ssm.Options) {
+		if region != "" {
+			o.Region = region
+		}
+	})
+
+	cmd := "kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml delete deployment -n confighub-system cub-worker --timeout=30s 2>&1 || true"
+	sendResult, err := ssmClient.SendCommand(ctx, &ssm.SendCommandInput{
+		InstanceIds:  []string{instanceID},
+		DocumentName: aws.String("AWS-RunShellScript"),
+		Parameters: map[string][]string{
+			"commands": {cmd},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to send SSM command: %w", err)
+	}
+
+	// Wait for command to complete
+	commandID := aws.ToString(sendResult.Command.CommandId)
+	waiter := ssm.NewCommandExecutedWaiter(ssmClient)
+	err = waiter.Wait(ctx, &ssm.GetCommandInvocationInput{
+		CommandId:  aws.String(commandID),
+		InstanceId: aws.String(instanceID),
+	}, 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("SSM command did not complete: %w", err)
+	}
+
+	log.Printf("[INFO] Worker deployment deleted on %s", instanceID)
+	return nil
 }
 
 // deleteDNSRecord removes A records for the domain and wildcard.
