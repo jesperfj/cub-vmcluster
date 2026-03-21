@@ -122,9 +122,10 @@ log_success "Region: $AWS_REGION"
 
 # Verify cub auth
 log_info "Checking ConfigHub credentials..."
-CUB_SERVER=$(cub config get server 2>/dev/null || echo "")
+cub space list >/dev/null 2>&1 || die "Not authenticated to ConfigHub. Run 'cub auth login' first."
+CUB_SERVER=$(grep -A5 'current-context' ~/.confighub/config.yaml 2>/dev/null | grep 'server' | head -1 | awk '{print $2}' || echo "")
 if [[ -z "$CUB_SERVER" ]]; then
-    die "Not authenticated to ConfigHub. Run 'cub auth login' first."
+    prompt CUB_SERVER "ConfigHub server URL" "https://hub.confighub.com"
 fi
 log_success "ConfigHub: $CUB_SERVER"
 
