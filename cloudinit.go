@@ -44,6 +44,11 @@ func renderUserData(cluster *VMCluster, workerID, workerSecret string, bridge *V
 		return "", fmt.Errorf("failed to parse userdata template: %w", err)
 	}
 
+	vmclusterImage := cluster.Spec.VMClusterWorkerImage
+	if vmclusterImage == "" {
+		vmclusterImage = "ghcr.io/jesperfj/cub-vmcluster:latest"
+	}
+
 	params := CloudInitParams{
 		ClusterName:   cluster.Metadata.Name,
 		K3sVersion:    cluster.Spec.K3sVersion,
@@ -59,7 +64,7 @@ func renderUserData(cluster *VMCluster, workerID, workerSecret string, bridge *V
 		InstallVMClusterWorker:   cluster.Spec.InstallVMClusterWorker,
 		VMClusterWorkerID:        bridge.confighubID,
 		VMClusterWorkerSecret:    bridge.confighubSecret,
-		VMClusterWorkerImage:     "ghcr.io/jesperfj/cub-vmcluster:latest",
+		VMClusterWorkerImage:     vmclusterImage,
 		VMClusterSubnetID:        bridge.subnetID,
 		VMClusterHostedZoneID:    bridge.hostedZoneID,
 		VMClusterInstanceProfile: bridge.instanceProfileID,

@@ -20,7 +20,8 @@ type VMClusterSpec struct {
 	K3sVersion              string     `yaml:"k3sVersion"`
 	Ingress                 IngressSpec `yaml:"ingress"`
 	Worker                  WorkerSpec `yaml:"worker"`
-	InstallVMClusterWorker  bool       `yaml:"installVMClusterWorker,omitempty"`
+	InstallVMClusterWorker      bool   `yaml:"installVMClusterWorker,omitempty"`
+	VMClusterWorkerImage        string `yaml:"vmclusterWorkerImage,omitempty"`
 }
 
 type IngressSpec struct {

@@ -111,6 +111,7 @@ This deploys the vmcluster worker as a pod in the cluster using the same credent
 | `spec.worker.spaceSlug` | ConfigHub space for the worker | required |
 | `spec.worker.providerTypes` | Bridge provider types | `["Kubernetes"]` |
 | `spec.installVMClusterWorker` | Deploy vmcluster worker in cluster | `false` |
+| `spec.vmclusterWorkerImage` | Container image for self-hosted worker | `ghcr.io/jesperfj/cub-vmcluster:latest` |
 
 ## How it works
 
