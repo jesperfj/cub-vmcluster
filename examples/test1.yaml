@@ -1,0 +1,22 @@
+apiVersion: demo.confighub.com/v1alpha1
+kind: VMCluster
+metadata:
+  name: test1
+spec:
+  instanceType: t4g.small
+  region: us-east-2
+  diskSizeGB: 30
+  k3sVersion: v1.35.2+k3s1
+  ingress:
+    enabled: true
+    domain: test1.cubdemo.com
+    tls:
+      enabled: true
+      email: ops@confighub.com
+  worker:
+    confighubURL: https://hub.confighub.com
+    slug: test1-worker
+    spaceSlug: demo-clusters
+    providerTypes:
+      - Kubernetes
+  installVMClusterWorker: true
