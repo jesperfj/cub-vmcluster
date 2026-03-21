@@ -40,6 +40,17 @@ prompt() {
     fi
 }
 
+# Portable replacement for mapfile (bash 3.2 compatible)
+# Usage: lines_to_array ARRAYNAME "$MULTILINE_STRING"
+lines_to_array() {
+    local _arrname="$1" _input="$2"
+    local _i=0
+    eval "$_arrname=()"
+    while IFS= read -r _line; do
+        [[ -n "$_line" ]] && eval "${_arrname}[${_i}]=\"\${_line}\"" && ((_i++))
+    done <<< "$_input"
+}
+
 pick_from_list() {
     local var="$1" prompt="$2"
     shift 2
@@ -54,7 +65,7 @@ pick_from_list() {
     local i=1
     for opt in "${options[@]}"; do
         echo "  $i) $opt"
-        ((i++))
+        i=$((i + 1))
     done
     echo ""
     echo -en "  ${BOLD}Choose${NC} [1]: "
@@ -108,7 +119,7 @@ if [[ -z "$VPC_LIST" ]]; then
     die "No VPCs found in $AWS_REGION. Create one first or choose a different region."
 fi
 
-mapfile -t VPC_OPTIONS <<< "$VPC_LIST"
+lines_to_array VPC_OPTIONS "$VPC_LIST"
 pick_from_list VPC_CHOICE "Select a VPC:" "${VPC_OPTIONS[@]}"
 VPC_ID=$(echo "$VPC_CHOICE" | cut -d' ' -f1)
 log_success "VPC: $VPC_ID"
@@ -128,7 +139,7 @@ if [[ -z "$SUBNET_LIST" ]]; then
     die "No subnets found in VPC $VPC_ID."
 fi
 
-mapfile -t SUBNET_OPTIONS <<< "$SUBNET_LIST"
+lines_to_array SUBNET_OPTIONS "$SUBNET_LIST"
 pick_from_list SUBNET_CHOICE "Select a subnet (public recommended):" "${SUBNET_OPTIONS[@]}"
 SUBNET_ID=$(echo "$SUBNET_CHOICE" | cut -d' ' -f1)
 log_success "Subnet: $SUBNET_ID"
@@ -144,8 +155,8 @@ ZONE_LIST=$(aws route53 list-hosted-zones \
 
 ZONE_ID=""
 if [[ -n "$ZONE_LIST" ]]; then
-    mapfile -t ZONE_OPTIONS <<< "$ZONE_LIST"
-    ZONE_OPTIONS+=("Skip — no DNS")
+    lines_to_array ZONE_OPTIONS "$ZONE_LIST"
+    ZONE_OPTIONS[${#ZONE_OPTIONS[@]}]="Skip — no DNS"
     pick_from_list ZONE_CHOICE "Select a Route53 hosted zone for DNS:" "${ZONE_OPTIONS[@]}"
     if [[ "$ZONE_CHOICE" != "Skip — no DNS" ]]; then
         ZONE_ID=$(echo "$ZONE_CHOICE" | cut -d' ' -f1)
@@ -188,7 +199,7 @@ for s in spaces:
 
 WORKER_SPACE=""
 if [[ -n "$SPACE_LIST" ]]; then
-    mapfile -t SPACE_OPTIONS <<< "$SPACE_LIST"
+    lines_to_array SPACE_OPTIONS "$SPACE_LIST"
     pick_from_list WORKER_SPACE "Which space should the vmcluster worker belong to?" "${SPACE_OPTIONS[@]}"
 else
     prompt WORKER_SPACE "Space slug for the vmcluster worker"
