@@ -47,7 +47,7 @@ func TestRenderUserData(t *testing.T) {
 		{"shebang", "#!/bin/bash"},
 		{"k3s version", "v1.35.2+k3s1"},
 		{"tls-san domain", "--tls-san test.demo.example.com"},
-		{"worker image", "ghcr.io/confighubai/confighub-worker:v0.1.12"},
+		{"worker image", "ghcr.io/confighubai/confighub-worker:latest"},
 		{"confighub url", "https://app.confighub.com"},
 		{"worker id", "wkr_test"},
 		{"worker secret", "ch_testsecret"},

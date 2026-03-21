@@ -143,6 +143,7 @@ This deploys the vmcluster worker as a pod in the cluster using the same credent
 | `spec.worker.slug` | Worker name (created automatically) | required |
 | `spec.worker.spaceSlug` | ConfigHub space for the worker | required |
 | `spec.worker.providerTypes` | Bridge provider types | `["Kubernetes"]` |
+| `spec.worker.image` | Container image for the cub-worker | `ghcr.io/confighubai/confighub-worker:latest` |
 | `spec.installVMClusterWorker` | Deploy vmcluster worker in cluster | `false` |
 | `spec.vmclusterWorkerImage` | Container image for self-hosted worker | `ghcr.io/jesperfj/cub-vmcluster:latest` |
 
@@ -228,7 +229,6 @@ Destroy deletes the worker deployment (clean disconnect), terminates the instanc
 
 - **Single availability zone** — clusters are provisioned in a single AZ (the subnet's AZ). No HA.
 - **No persistent storage** — EBS root volume is deleted on termination. These are ephemeral demo clusters.
-- **Worker image pinning** — the cub-worker image is hardcoded to `v0.1.12`. Future: make it configurable in the spec.
 - **No Import** — the Import bridge operation is not implemented. Existing EC2 instances cannot be adopted as VMClusters.
 - **TTL / auto-sleep** — no automatic expiry or instance scheduling. Clusters run until explicitly destroyed.
 - **Boot time** — clusters take ~2 minutes to boot. Most of the time is k3s startup and cert-manager deployment.

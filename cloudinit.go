@@ -45,6 +45,11 @@ func renderUserData(cluster *VMCluster, workerID, workerSecret string, bridge *V
 		return "", fmt.Errorf("failed to parse userdata template: %w", err)
 	}
 
+	workerImage := cluster.Spec.Worker.Image
+	if workerImage == "" {
+		workerImage = "ghcr.io/confighubai/confighub-worker:latest"
+	}
+
 	vmclusterImage := cluster.Spec.VMClusterWorkerImage
 	if vmclusterImage == "" {
 		vmclusterImage = "ghcr.io/jesperfj/cub-vmcluster:latest"
@@ -60,7 +65,7 @@ func renderUserData(cluster *VMCluster, workerID, workerSecret string, bridge *V
 		IngressDomain: cluster.Spec.Ingress.Domain,
 		TLSEnabled:    cluster.Spec.Ingress.TLS.Enabled,
 		TLSEmail:      cluster.Spec.Ingress.TLS.Email,
-		WorkerImage:   "ghcr.io/confighubai/confighub-worker:v0.1.12",
+		WorkerImage:   workerImage,
 
 		InstallVMClusterWorker:   cluster.Spec.InstallVMClusterWorker,
 		VMClusterWorkerID:        bridge.confighubID,

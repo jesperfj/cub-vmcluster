@@ -40,6 +40,7 @@ type WorkerSpec struct {
 	Slug          string   `yaml:"slug"`
 	SpaceSlug     string   `yaml:"spaceSlug"`
 	ProviderTypes []string `yaml:"providerTypes"`
+	Image         string   `yaml:"image,omitempty"`
 
 	// Deprecated: use slug + spaceSlug instead. These are still supported
 	// for backward compatibility but will be removed.
