@@ -306,6 +306,62 @@ DOCKER_CMD="$DOCKER_CMD ghcr.io/jesperfj/cub-vmcluster:latest"
 
 log_success "Configuration written to $ENV_FILE"
 
+# --- Create first VMCluster unit ---
+echo ""
+echo -e "${BOLD}First cluster setup${NC}"
+echo ""
+prompt CLUSTER_NAME "Cluster name" "cluster1"
+prompt CLUSTER_INSTANCE_TYPE "Instance type" "t4g.small"
+prompt CLUSTER_K3S_VERSION "k3s version" "v1.35.2+k3s1"
+
+CLUSTER_DOMAIN=""
+if [[ -n "$ZONE_ID" ]]; then
+    # Derive domain from zone
+    ZONE_NAME=$(aws route53 get-hosted-zone --id "$ZONE_ID" --query "HostedZone.Name" --output text | sed 's/\.$//')
+    prompt CLUSTER_DOMAIN "Cluster domain" "${CLUSTER_NAME}.${ZONE_NAME}"
+fi
+
+CLUSTER_WORKER_SLUG="${CLUSTER_NAME}-worker"
+
+# Find the vmcluster target
+VMCLUSTER_TARGET=$(cub target list --space "$WORKER_SPACE" --jq ".[].Slug" 2>/dev/null | grep -i vmcluster | head -1 || echo "")
+
+CLUSTER_YAML="apiVersion: demo.confighub.com/v1alpha1
+kind: VMCluster
+metadata:
+  name: ${CLUSTER_NAME}
+spec:
+  instanceType: ${CLUSTER_INSTANCE_TYPE}
+  region: ${AWS_REGION}
+  diskSizeGB: 30
+  k3sVersion: ${CLUSTER_K3S_VERSION}
+  ingress:
+    enabled: $(if [[ -n "$CLUSTER_DOMAIN" ]]; then echo "true"; else echo "false"; fi)
+    domain: ${CLUSTER_DOMAIN}
+    tls:
+      enabled: $(if [[ -n "$CLUSTER_DOMAIN" ]]; then echo "true"; else echo "false"; fi)
+      email: ops@confighub.com
+  worker:
+    confighubURL: ${CUB_SERVER}
+    slug: ${CLUSTER_WORKER_SLUG}
+    spaceSlug: ${WORKER_SPACE}
+    providerTypes:
+      - Kubernetes
+  installVMClusterWorker: true"
+
+log_info "Creating unit '${CLUSTER_NAME}' in space '${WORKER_SPACE}'..."
+TARGET_FLAG=""
+if [[ -n "$VMCLUSTER_TARGET" ]]; then
+    TARGET_FLAG="--target $VMCLUSTER_TARGET"
+fi
+
+echo "$CLUSTER_YAML" | cub unit create --space "$WORKER_SPACE" "$CLUSTER_NAME" - \
+    $TARGET_FLAG --allow-exists 2>&1 || {
+    log_warn "Failed to create unit. You can create it manually in the ConfigHub UI."
+}
+
+log_success "Unit created"
+
 # --- Summary ---
 echo ""
 echo "============================================"
@@ -318,10 +374,17 @@ echo "  Subnet:   $SUBNET_ID"
 echo "  Profile:  $INSTANCE_PROFILE"
 [[ -n "$ZONE_ID" ]] && echo "  DNS Zone: $ZONE_ID"
 echo ""
-echo "  Start the worker with:"
+echo "  Next steps:"
 echo ""
-echo "    $DOCKER_CMD"
+echo "  1. Start the worker:"
 echo ""
-echo "  Then create a VMCluster unit in ConfigHub and apply it."
-echo "  See examples/test1.yaml for a sample configuration."
+echo "     $DOCKER_CMD"
 echo ""
+echo "  2. Open ConfigHub and verify the worker is connected"
+echo "  3. Apply the '${CLUSTER_NAME}' unit to provision your first cluster"
+echo ""
+if [[ -z "$VMCLUSTER_TARGET" ]]; then
+    echo -e "  ${YELLOW}Note:${NC} Assign the unit to the vmcluster target before applying."
+    echo "  The target will appear after the worker connects."
+    echo ""
+fi
