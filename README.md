@@ -80,6 +80,39 @@ spec:
 
 Assign it to the vmcluster worker's target and apply. Within a couple minutes you'll have a running k3s cluster with its own ConfigHub worker connected and ready for workloads.
 
+### Without DNS
+
+DNS is optional. If you don't have a Route53 hosted zone, omit the ingress section:
+
+```yaml
+apiVersion: demo.confighub.com/v1alpha1
+kind: VMCluster
+metadata:
+  name: my-cluster
+spec:
+  instanceType: t4g.small
+  region: us-east-2
+  diskSizeGB: 30
+  k3sVersion: v1.35.2+k3s1
+  worker:
+    confighubURL: https://hub.confighub.com
+    slug: my-cluster-worker
+    spaceSlug: my-space
+    providerTypes:
+      - Kubernetes
+```
+
+The cluster will still be fully functional — you can deploy workloads and access them by IP. Ingress with hostnames and TLS requires a Route53 hosted zone.
+
+### DNS setup
+
+If you want hostname-based ingress with TLS, you need a domain with DNS hosted in Route53. The bootstrap script will discover available zones. For each cluster, the bridge creates:
+
+- `<cluster-name>.<domain>` → instance public IP
+- `*.<cluster-name>.<domain>` → instance public IP (wildcard)
+
+This means any service deployed with an ingress hostname like `myapp.cluster1.example.com` will route to the cluster automatically. TLS certificates are provisioned via cert-manager and Let's Encrypt.
+
 ## Self-hosting
 
 The vmcluster worker can move into one of its own clusters so you don't need to keep running it locally. Add `installVMClusterWorker: true` to the first cluster you provision:
