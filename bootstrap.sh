@@ -383,8 +383,8 @@ echo ""
 echo "  2. Open ConfigHub and verify the worker is connected"
 echo "  3. Apply the '${CLUSTER_NAME}' unit to provision your first cluster"
 echo ""
-if [[ -z "$VMCLUSTER_TARGET" ]]; then
-    echo -e "  ${YELLOW}Note:${NC} Assign the unit to the vmcluster target before applying."
-    echo "  The target will appear after the worker connects."
-    echo ""
-fi
+EXPECTED_TARGET="${WORKER_SLUG}-vmcluster-kubernetes-yaml-default"
+echo -e "  ${YELLOW}Note:${NC} Before applying, assign the unit to the target:"
+echo "     ${EXPECTED_TARGET}"
+echo "  This target appears after the worker connects."
+echo ""
