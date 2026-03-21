@@ -169,7 +169,7 @@ SUBNET_LIST=$(aws ec2 describe-subnets --region "$AWS_REGION" \
     --query "Subnets[].[SubnetId,AvailabilityZone,CidrBlock,MapPublicIpOnLaunch,Tags[?Key=='Name']|[0].Value || 'unnamed']" \
     --output text | while read -r id az cidr public name; do
         label="$id ($name, $az, $cidr"
-        [[ "$public" == "True" ]] && label="$label, public"
+        if [[ "$public" == "True" ]]; then label="$label, public"; fi
         echo "$label)"
     done)
 
