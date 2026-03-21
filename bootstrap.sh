@@ -47,7 +47,10 @@ lines_to_array() {
     local _i=0
     eval "$_arrname=()"
     while IFS= read -r _line; do
-        [[ -n "$_line" ]] && eval "${_arrname}[${_i}]=\"\${_line}\"" && ((_i++))
+        if [[ -n "$_line" ]]; then
+            eval "${_arrname}[${_i}]=\"\${_line}\""
+            _i=$((_i + 1))
+        fi
     done <<< "$_input"
 }
 
