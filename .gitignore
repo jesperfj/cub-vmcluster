@@ -1,3 +1,4 @@
+.env
 bin/
 cub-vmcluster
 worker.log
