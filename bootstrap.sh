@@ -89,30 +89,48 @@ echo ""
 command -v aws >/dev/null 2>&1 || die "AWS CLI not found. Install it first."
 command -v cub >/dev/null 2>&1 || die "cub CLI not found. Install it first: https://docs.confighub.com/cli"
 
+# --- Select AWS profile ---
+if [[ -z "${AWS_PROFILE:-}" ]]; then
+    log_info "Discovering AWS profiles..."
+    PROFILE_LIST=$(grep '^\[profile ' ~/.aws/config 2>/dev/null | sed 's/\[profile \(.*\)\]/\1/' || echo "")
+    if [[ -n "$PROFILE_LIST" ]]; then
+        lines_to_array PROFILE_OPTIONS "$PROFILE_LIST"
+        PROFILE_OPTIONS[${#PROFILE_OPTIONS[@]}]="default"
+        pick_from_list PROFILE_CHOICE "Select an AWS profile:" "${PROFILE_OPTIONS[@]}"
+        if [[ "$PROFILE_CHOICE" != "default" ]]; then
+            export AWS_PROFILE="$PROFILE_CHOICE"
+        fi
+    fi
+fi
+
+if [[ -n "${AWS_PROFILE:-}" ]]; then
+    log_info "Using AWS profile: $AWS_PROFILE"
+fi
+
 # Verify AWS auth
 log_info "Checking AWS credentials..."
-AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || \
-    die "Not authenticated to AWS. Run 'aws configure' or 'aws sso login' first."
+AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || {
+    if [[ -n "${AWS_PROFILE:-}" ]]; then
+        log_info "Profile $AWS_PROFILE needs login, attempting SSO login..."
+        aws sso login --profile "$AWS_PROFILE"
+        AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || \
+            die "Still not authenticated after SSO login."
+    else
+        die "Not authenticated to AWS. Run 'aws configure' or 'aws sso login' first."
+    fi
+}
 AWS_REGION=$(aws configure get region 2>/dev/null || echo "")
 log_success "AWS account: $AWS_ACCOUNT"
 
 # Detect AWS auth method for Docker
 AWS_AUTH_METHOD=""
-DOCKER_AWS_ARGS=""
 if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]]; then
     AWS_AUTH_METHOD="env"
     log_info "AWS auth: environment variables"
 elif [[ -n "${AWS_PROFILE:-}" ]]; then
     AWS_AUTH_METHOD="profile"
-    log_info "AWS auth: profile $AWS_PROFILE"
-elif aws configure get sso_account_id >/dev/null 2>&1; then
-    # Default profile uses SSO
-    AWS_AUTH_METHOD="sso"
-    log_info "AWS auth: SSO (default profile)"
 else
-    # Static credentials in default profile or instance profile
     AWS_AUTH_METHOD="default"
-    log_info "AWS auth: default credentials"
 fi
 
 if [[ -z "$AWS_REGION" ]]; then
