@@ -197,10 +197,11 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 				},
 			},
 		},
-		// IMDSv2 required
+		// IMDSv2 required, hop limit 2 so pods can reach IMDS
 		MetadataOptions: &ec2types.InstanceMetadataOptionsRequest{
-			HttpTokens:   ec2types.HttpTokensStateRequired,
-			HttpEndpoint: ec2types.InstanceMetadataEndpointStateEnabled,
+			HttpTokens:              ec2types.HttpTokensStateRequired,
+			HttpEndpoint:            ec2types.InstanceMetadataEndpointStateEnabled,
+			HttpPutResponseHopLimit: aws.Int32(2),
 		},
 	}
 

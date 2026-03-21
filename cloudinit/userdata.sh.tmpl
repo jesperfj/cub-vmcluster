@@ -131,6 +131,8 @@ spec:
           value: "{{.VMClusterHostedZoneID}}"
         - name: INSTANCE_PROFILE_NAME
           value: "{{.VMClusterInstanceProfile}}"
+        - name: AWS_REGION
+          value: "{{.AWSRegion}}"
 VMCMANIFEST
 {{end}}
 

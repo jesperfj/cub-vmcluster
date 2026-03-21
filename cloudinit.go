@@ -24,13 +24,14 @@ type CloudInitParams struct {
 	WorkerImage   string
 
 	// VMCluster worker self-install
-	InstallVMClusterWorker bool
-	VMClusterWorkerID      string
-	VMClusterWorkerSecret  string
-	VMClusterWorkerImage   string
-	VMClusterSubnetID      string
-	VMClusterHostedZoneID  string
+	InstallVMClusterWorker   bool
+	VMClusterWorkerID        string
+	VMClusterWorkerSecret    string
+	VMClusterWorkerImage     string
+	VMClusterSubnetID        string
+	VMClusterHostedZoneID    string
 	VMClusterInstanceProfile string
+	AWSRegion                string
 }
 
 func renderUserData(cluster *VMCluster, workerID, workerSecret string, bridge *VMClusterBridge) (string, error) {
@@ -68,6 +69,7 @@ func renderUserData(cluster *VMCluster, workerID, workerSecret string, bridge *V
 		VMClusterSubnetID:        bridge.subnetID,
 		VMClusterHostedZoneID:    bridge.hostedZoneID,
 		VMClusterInstanceProfile: bridge.instanceProfileID,
+		AWSRegion:                cluster.Spec.Region,
 	}
 
 	var buf bytes.Buffer
