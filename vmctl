@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# vmctl — utility for interacting with vmcluster instances
+# =============================================================================
+#
+# Usage:
+#   ./vmctl kubeconfig <cluster-name>     Get kubeconfig (server rewritten to public IP)
+#   ./vmctl shell <cluster-name>          Open an SSM shell session
+#   ./vmctl exec <cluster-name> -- <cmd>  Run a command via SSM
+#   ./vmctl list                          List running vmcluster instances
+
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-2}}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+die() { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
+
+# Resolve cluster name to instance ID and public IP
+resolve_instance() {
+    local cluster_name="$1"
+    local result
+    result=$(aws ec2 describe-instances --region "$REGION" \
+        --filters \
+            "Name=tag:confighub:cluster-name,Values=$cluster_name" \
+            "Name=instance-state-name,Values=running" \
+        --query "Reservations[].Instances[].[InstanceId,PublicIpAddress]" \
+        --output text | head -1)
+
+    if [[ -z "$result" ]]; then
+        die "No running instance found for cluster '$cluster_name'"
+    fi
+
+    INSTANCE_ID=$(echo "$result" | awk '{print $1}')
+    PUBLIC_IP=$(echo "$result" | awk '{print $2}')
+}
+
+# Run a command on the instance via SSM and print the output
+ssm_exec() {
+    local instance_id="$1"
+    shift
+    local cmd="$*"
+
+    local cmd_id
+    cmd_id=$(aws ssm send-command --region "$REGION" \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "commands=[\"$cmd\"]" \
+        --query "Command.CommandId" --output text)
+
+    # Poll for completion
+    local status="InProgress"
+    while [[ "$status" == "InProgress" || "$status" == "Pending" ]]; do
+        sleep 1
+        status=$(aws ssm get-command-invocation --region "$REGION" \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query "Status" --output text 2>/dev/null || echo "InProgress")
+    done
+
+    # Get output
+    local output
+    output=$(aws ssm get-command-invocation --region "$REGION" \
+        --command-id "$cmd_id" \
+        --instance-id "$instance_id" \
+        --query "StandardOutputContent" --output text)
+
+    local err_output
+    err_output=$(aws ssm get-command-invocation --region "$REGION" \
+        --command-id "$cmd_id" \
+        --instance-id "$instance_id" \
+        --query "StandardErrorContent" --output text)
+
+    if [[ -n "$output" ]]; then
+        echo "$output"
+    fi
+    if [[ -n "$err_output" ]]; then
+        echo "$err_output" >&2
+    fi
+
+    if [[ "$status" != "Success" ]]; then
+        return 1
+    fi
+}
+
+# --- Commands ---
+
+cmd_kubeconfig() {
+    local cluster_name="${1:?Usage: vmctl kubeconfig <cluster-name>}"
+    resolve_instance "$cluster_name"
+
+    local kubeconfig
+    kubeconfig=$(ssm_exec "$INSTANCE_ID" "cat /etc/rancher/k3s/k3s.yaml")
+
+    # Rewrite server URL from 127.0.0.1 to public IP
+    echo "$kubeconfig" | sed "s|https://127.0.0.1:6443|https://${PUBLIC_IP}:6443|g"
+}
+
+cmd_shell() {
+    local cluster_name="${1:?Usage: vmctl shell <cluster-name>}"
+    resolve_instance "$cluster_name"
+
+    echo -e "${BLUE}▸${NC} Opening shell to $cluster_name ($INSTANCE_ID)"
+    aws ssm start-session --region "$REGION" --target "$INSTANCE_ID"
+}
+
+cmd_exec() {
+    local cluster_name="${1:?Usage: vmctl exec <cluster-name> -- <command>}"
+    shift
+
+    # Skip the -- separator if present
+    if [[ "${1:-}" == "--" ]]; then
+        shift
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        die "Usage: vmctl exec <cluster-name> -- <command>"
+    fi
+
+    resolve_instance "$cluster_name"
+    ssm_exec "$INSTANCE_ID" "$*"
+}
+
+cmd_list() {
+    aws ec2 describe-instances --region "$REGION" \
+        --filters \
+            "Name=tag:confighub:managed-by,Values=cub-vmcluster" \
+            "Name=instance-state-name,Values=running" \
+        --query "Reservations[].Instances[].[Tags[?Key=='confighub:cluster-name']|[0].Value,InstanceId,InstanceType,PublicIpAddress,Tags[?Key=='confighub:status']|[0].Value]" \
+        --output table
+}
+
+# --- Main ---
+
+usage() {
+    echo "Usage: vmctl <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  kubeconfig <name>        Get kubeconfig for a cluster"
+    echo "  shell <name>             Open SSM shell to a cluster"
+    echo "  exec <name> -- <cmd>     Run command on a cluster"
+    echo "  list                     List running vmcluster instances"
+}
+
+case "${1:-}" in
+    kubeconfig) shift; cmd_kubeconfig "$@" ;;
+    shell)      shift; cmd_shell "$@" ;;
+    exec)       shift; cmd_exec "$@" ;;
+    list)       cmd_list ;;
+    *)          usage ;;
+esac
