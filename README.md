@@ -135,6 +135,26 @@ The bridge:
 5. Creates Route53 DNS records (A + wildcard) if configured
 6. Reports progress back to ConfigHub throughout the process
 
+## Cluster access
+
+The `vmctl` utility provides quick access to running clusters via AWS SSM. It reads configuration from `.env` (created by `bootstrap.sh`).
+
+```bash
+./vmctl list                              # List running vmcluster instances
+./vmctl kubeconfig cluster1               # Get kubeconfig (server rewritten to public IP)
+./vmctl shell cluster1                    # Open an interactive SSM shell
+./vmctl exec cluster1 -- kubectl get pods -A  # Run a command remotely
+```
+
+To use the kubeconfig with kubectl:
+
+```bash
+./vmctl kubeconfig cluster1 > /tmp/cluster1.yaml
+KUBECONFIG=/tmp/cluster1.yaml kubectl get nodes
+```
+
+No SSH keys or open ports required — access is via AWS Systems Manager.
+
 ## Infrastructure management
 
 ```bash
