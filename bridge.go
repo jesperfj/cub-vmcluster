@@ -95,7 +95,12 @@ func (b *VMClusterBridge) route53Client(ctx context.Context) (*route53.Client, e
 	if err != nil {
 		return nil, err
 	}
-	return route53.NewFromConfig(cfg), nil
+	// Route53 is global but the SDK still needs a region for the endpoint.
+	// Force us-east-1 to avoid failures when the default region isn't set
+	// (e.g., in-cluster pods without AWS_REGION).
+	return route53.NewFromConfig(cfg, func(o *route53.Options) {
+		o.Region = "us-east-1"
+	}), nil
 }
 
 func (b *VMClusterBridge) ID() api.BridgeWorkerID {

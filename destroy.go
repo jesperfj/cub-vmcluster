@@ -134,7 +134,8 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 			StartedAt:    startTime,
 			TerminatedAt: &terminatedAt,
 		},
-		LiveData: []byte{},
+		LiveData:  []byte{},
+		LiveState: []byte{},
 	})
 }
 
