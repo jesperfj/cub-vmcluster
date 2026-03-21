@@ -96,6 +96,25 @@ AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/n
 AWS_REGION=$(aws configure get region 2>/dev/null || echo "")
 log_success "AWS account: $AWS_ACCOUNT"
 
+# Detect AWS auth method for Docker
+AWS_AUTH_METHOD=""
+DOCKER_AWS_ARGS=""
+if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]]; then
+    AWS_AUTH_METHOD="env"
+    log_info "AWS auth: environment variables"
+elif [[ -n "${AWS_PROFILE:-}" ]]; then
+    AWS_AUTH_METHOD="profile"
+    log_info "AWS auth: profile $AWS_PROFILE"
+elif aws configure get sso_account_id >/dev/null 2>&1; then
+    # Default profile uses SSO
+    AWS_AUTH_METHOD="sso"
+    log_info "AWS auth: SSO (default profile)"
+else
+    # Static credentials in default profile or instance profile
+    AWS_AUTH_METHOD="default"
+    log_info "AWS auth: default credentials"
+fi
+
 if [[ -z "$AWS_REGION" ]]; then
     prompt AWS_REGION "AWS region" "us-east-2"
 fi
@@ -238,7 +257,36 @@ CONFIGHUB_WORKER_SECRET=$WORKER_SECRET
 SUBNET_ID=$SUBNET_ID
 INSTANCE_PROFILE_NAME=$INSTANCE_PROFILE
 ROUTE53_HOSTED_ZONE_ID=$ZONE_ID
+AWS_REGION=$AWS_REGION
 EOF
+
+# Build docker run command based on AWS auth method
+DOCKER_CMD="docker run --rm --env-file .env"
+case "$AWS_AUTH_METHOD" in
+    env)
+        # Pass through env vars
+        cat >> "$ENV_FILE" <<EOF
+AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+EOF
+        [[ -n "${AWS_SESSION_TOKEN:-}" ]] && echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" >> "$ENV_FILE"
+        ;;
+    profile)
+        # Mount AWS config and pass profile
+        echo "AWS_PROFILE=$AWS_PROFILE" >> "$ENV_FILE"
+        DOCKER_CMD="$DOCKER_CMD -v \$HOME/.aws:/root/.aws:ro"
+        ;;
+    sso)
+        # SSO needs the full ~/.aws directory (config + sso cache)
+        DOCKER_CMD="$DOCKER_CMD -v \$HOME/.aws:/root/.aws:ro"
+        ;;
+    default)
+        # Static creds in ~/.aws/credentials
+        DOCKER_CMD="$DOCKER_CMD -v \$HOME/.aws:/root/.aws:ro"
+        ;;
+esac
+
+DOCKER_CMD="$DOCKER_CMD ghcr.io/jesperfj/cub-vmcluster:latest"
 
 log_success "Configuration written to $ENV_FILE"
 
@@ -256,7 +304,7 @@ echo "  Profile:  $INSTANCE_PROFILE"
 echo ""
 echo "  Start the worker with:"
 echo ""
-echo "    docker run --rm --env-file .env ghcr.io/jesperfj/cub-vmcluster:main"
+echo "    $DOCKER_CMD"
 echo ""
 echo "  Then create a VMCluster unit in ConfigHub and apply it."
 echo "  See examples/test1.yaml for a sample configuration."
