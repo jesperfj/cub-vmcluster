@@ -713,13 +713,74 @@ cmd_status() {
 
     echo ""
     log_info "Clusters"
-    aws ec2 describe-instances --region "$REGION" \
+
+    # Get detailed instance info including launch time
+    local instances
+    instances=$(aws ec2 describe-instances --region "$REGION" \
         --filters \
             "Name=tag:confighub:managed-by,Values=cub-vmcluster" \
-            "Name=instance-state-name,Values=running" \
-        --query "Reservations[].Instances[].[Tags[?Key=='confighub:cluster-name']|[0].Value,InstanceId,InstanceType,PublicIpAddress,Tags[?Key=='confighub:status']|[0].Value]" \
-        --output table
+            "Name=instance-state-name,Values=running,stopped,stopping" \
+        --query "Reservations[].Instances[].[Tags[?Key=='confighub:cluster-name']|[0].Value,InstanceId,State.Name,InstanceType,PublicIpAddress,LaunchTime,Tags[?Key=='confighub:status']|[0].Value]" \
+        --output text)
 
+    if [[ -z "$instances" ]]; then
+        echo "    No clusters found"
+    else
+        printf "    %-12s %-22s %-9s %-12s %-16s %-12s %s\n" \
+            "NAME" "INSTANCE" "STATE" "TYPE" "PUBLIC IP" "UPTIME" "STATUS"
+        echo "$instances" | while read -r name id state itype ip launch status; do
+            # Calculate uptime
+            local uptime="unknown"
+            if [[ -n "$launch" && "$launch" != "None" ]]; then
+                local launch_epoch now_epoch diff_s
+                launch_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${launch%%.*}" "+%s" 2>/dev/null || \
+                               date -d "${launch}" "+%s" 2>/dev/null || echo "0")
+                now_epoch=$(date "+%s")
+                if [[ "$launch_epoch" -gt 0 ]]; then
+                    diff_s=$((now_epoch - launch_epoch))
+                    if [[ $diff_s -lt 3600 ]]; then
+                        uptime="$((diff_s / 60))m"
+                    elif [[ $diff_s -lt 86400 ]]; then
+                        uptime="$((diff_s / 3600))h$((diff_s % 3600 / 60))m"
+                    else
+                        uptime="$((diff_s / 86400))d$((diff_s % 86400 / 3600))h"
+                    fi
+                fi
+            fi
+            printf "    %-12s %-22s %-9s %-12s %-16s %-12s %s\n" \
+                "${name:-?}" "$id" "$state" "$itype" "${ip:-—}" "$uptime" "${status:-?}"
+        done
+
+        # Check worker health on each running instance
+        echo ""
+        log_info "Worker health"
+        echo "$instances" | while read -r name id state itype ip launch status; do
+            if [[ "$state" != "running" ]]; then
+                echo "    $name: instance $state"
+                continue
+            fi
+            local worker_info
+            worker_info=$(aws ssm send-command --region "$REGION" \
+                --instance-ids "$id" \
+                --document-name "AWS-RunShellScript" \
+                --parameters 'commands=["kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get pods -n confighub-system -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount,AGE:.metadata.creationTimestamp --no-headers 2>&1"]' \
+                --query "Command.CommandId" --output text 2>/dev/null) || true
+            if [[ -n "$worker_info" ]]; then
+                sleep 3
+                local output
+                output=$(aws ssm get-command-invocation --region "$REGION" \
+                    --command-id "$worker_info" \
+                    --instance-id "$id" \
+                    --query "StandardOutputContent" --output text 2>/dev/null || echo "    (SSM timeout)")
+                echo "    $name:"
+                echo "$output" | sed 's/^/      /'
+            else
+                echo "    $name: SSM unavailable"
+            fi
+        done
+    fi
+
+    echo ""
     log_info "Infrastructure"
     local vpc_id
     vpc_id=$(aws ec2 describe-vpcs --region "$REGION" \
@@ -748,7 +809,7 @@ cmd_status() {
     fi
 
     if [[ -n "${ROUTE53_HOSTED_ZONE_ID:-}" ]]; then
-        echo "    Route53 zone: ${ROUTE53_HOSTED_ZONE_ID}"
+        log_info "DNS records"
         aws route53 list-resource-record-sets --hosted-zone-id "$ROUTE53_HOSTED_ZONE_ID" \
             --query "ResourceRecordSets[?Type == 'A'].[Name,ResourceRecords[0].Value]" --output table 2>/dev/null || true
     fi
