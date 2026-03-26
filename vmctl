@@ -773,7 +773,10 @@ cmd_status() {
                     --instance-id "$id" \
                     --query "StandardOutputContent" --output text 2>/dev/null || echo "    (SSM timeout)")
                 echo "    $name:"
-                echo "$output" | sed 's/^/      /'
+                printf "      %-45s %-10s %-10s %s\n" "POD" "STATUS" "RESTARTS" "CREATED"
+                echo "$output" | while read -r pname pstatus prestarts pcreated; do
+                    printf "      %-45s %-10s %-10s %s\n" "$pname" "$pstatus" "$prestarts" "$pcreated"
+                done
             else
                 echo "    $name: SSM unavailable"
             fi
