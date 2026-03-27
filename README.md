@@ -166,6 +166,7 @@ The bridge:
 
 ```bash
 ./vmctl list                              # List running clusters
+./vmctl resize cluster1 t4g.medium        # Resize instance (stop/change/start)
 ./vmctl kubeconfig cluster1               # Get kubeconfig (server rewritten to public IP)
 ./vmctl shell cluster1                    # Open an interactive SSM shell
 ./vmctl exec cluster1 -- kubectl get pods -A  # Run a command remotely
