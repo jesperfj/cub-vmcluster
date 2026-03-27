@@ -873,8 +873,8 @@ cmd_resize() {
         local domain
         domain=$(aws route53 list-resource-record-sets \
             --hosted-zone-id "$ROUTE53_HOSTED_ZONE_ID" \
-            --query "ResourceRecordSets[?Type=='A' && ResourceRecords[0].Value=='$PUBLIC_IP' && !starts_with(Name, '\\\\052')].Name" \
-            --output text | head -1 | sed 's/\.$//')
+            --query "ResourceRecordSets[?Type=='A' && ResourceRecords[0].Value=='$PUBLIC_IP' && !contains(Name, '*')].Name | [0]" \
+            --output text | sed 's/\.$//')
         if [[ -n "$domain" ]]; then
             log_info "Updating DNS: $domain → $new_ip"
             aws route53 change-resource-record-sets \
