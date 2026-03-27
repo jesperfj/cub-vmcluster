@@ -67,7 +67,18 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		if err == nil && len(desc.Reservations) > 0 && len(desc.Reservations[0].Instances) > 0 {
 			inst := desc.Reservations[0].Instances[0]
 			if inst.State.Name == ec2types.InstanceStateNameRunning {
-				// Already running — report synced
+				// Check if instance type needs to change
+				currentType := string(inst.InstanceType)
+				desiredType := cluster.Spec.InstanceType
+				if desiredType == "" {
+					desiredType = "t3.medium"
+				}
+
+				if currentType != desiredType {
+					return b.resizeInstance(ctx, payload, startTime, ec2c, &cluster, &existing, desiredType)
+				}
+
+				// No changes — report synced
 				terminatedAt := time.Now()
 				return ctx.SendStatus(&api.ActionResult{
 					UnitID:            payload.UnitID,
@@ -77,7 +88,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 						Action:       api.ActionApply,
 						Result:       api.ActionResultApplySynced,
 						Status:       api.ActionStatusCompleted,
-						Message:      fmt.Sprintf("Instance %s already running", existing.InstanceID),
+						Message:      fmt.Sprintf("Instance %s already running (%s)", existing.InstanceID, currentType),
 						StartedAt:    startTime,
 						TerminatedAt: &terminatedAt,
 					},
@@ -391,6 +402,187 @@ func (b *VMClusterBridge) resolveWorkerCredentials(
 	}
 
 	return creds.WorkerID, creds.Secret, nil
+}
+
+// resizeInstance stops the instance, changes its type, starts it, and updates DNS.
+func (b *VMClusterBridge) resizeInstance(
+	ctx api.BridgeContext,
+	payload api.BridgePayload,
+	startTime time.Time,
+	ec2c *ec2.Client,
+	cluster *VMCluster,
+	existing *LiveState,
+	desiredType string,
+) error {
+	awsCtx := ctx.Context()
+	instanceID := existing.InstanceID
+
+	// Step 1: Stop the instance
+	_ = ctx.SendStatus(&api.ActionResult{
+		UnitID:            payload.UnitID,
+		SpaceID:           payload.SpaceID,
+		QueuedOperationID: payload.QueuedOperationID,
+		ActionResultBaseMeta: api.ActionResultMeta{
+			Action:    api.ActionApply,
+			Result:    api.ActionResultNone,
+			Status:    api.ActionStatusProgressing,
+			Message:   fmt.Sprintf("Stopping instance %s to change type to %s", instanceID, desiredType),
+			StartedAt: startTime,
+		},
+	})
+
+	_, err := ec2c.StopInstances(awsCtx, &ec2.StopInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to stop instance: %v", err))
+	}
+
+	stoppedWaiter := ec2.NewInstanceStoppedWaiter(ec2c)
+	if err := stoppedWaiter.Wait(awsCtx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	}, 5*time.Minute); err != nil {
+		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("instance failed to stop: %v", err))
+	}
+	log.Printf("[INFO] Instance %s stopped", instanceID)
+
+	// Step 2: Change instance type
+	_ = ctx.SendStatus(&api.ActionResult{
+		UnitID:            payload.UnitID,
+		SpaceID:           payload.SpaceID,
+		QueuedOperationID: payload.QueuedOperationID,
+		ActionResultBaseMeta: api.ActionResultMeta{
+			Action:    api.ActionApply,
+			Result:    api.ActionResultNone,
+			Status:    api.ActionStatusProgressing,
+			Message:   fmt.Sprintf("Changing instance type to %s", desiredType),
+			StartedAt: startTime,
+		},
+	})
+
+	_, err = ec2c.ModifyInstanceAttribute(awsCtx, &ec2.ModifyInstanceAttributeInput{
+		InstanceId: aws.String(instanceID),
+		InstanceType: &ec2types.AttributeValue{
+			Value: aws.String(desiredType),
+		},
+	})
+	if err != nil {
+		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to change instance type: %v", err))
+	}
+	log.Printf("[INFO] Instance %s type changed to %s", instanceID, desiredType)
+
+	// Step 3: Start the instance
+	_ = ctx.SendStatus(&api.ActionResult{
+		UnitID:            payload.UnitID,
+		SpaceID:           payload.SpaceID,
+		QueuedOperationID: payload.QueuedOperationID,
+		ActionResultBaseMeta: api.ActionResultMeta{
+			Action:    api.ActionApply,
+			Result:    api.ActionResultNone,
+			Status:    api.ActionStatusProgressing,
+			Message:   fmt.Sprintf("Starting instance %s", instanceID),
+			StartedAt: startTime,
+		},
+	})
+
+	_, err = ec2c.StartInstances(awsCtx, &ec2.StartInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to start instance: %v", err))
+	}
+
+	runningWaiter := ec2.NewInstanceRunningWaiter(ec2c)
+	if err := runningWaiter.Wait(awsCtx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	}, 5*time.Minute); err != nil {
+		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("instance failed to start: %v", err))
+	}
+
+	// Get the new public IP
+	desc, err := ec2c.DescribeInstances(awsCtx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to describe instance: %v", err))
+	}
+	inst := desc.Reservations[0].Instances[0]
+	publicIP := aws.ToString(inst.PublicIpAddress)
+	privateIP := aws.ToString(inst.PrivateIpAddress)
+	log.Printf("[INFO] Instance %s running at %s (was %s)", instanceID, publicIP, existing.PublicIP)
+
+	// Step 4: Update DNS if IP changed
+	if publicIP != existing.PublicIP && cluster.Spec.Ingress.Domain != "" && b.hostedZoneID != "" {
+		_ = ctx.SendStatus(&api.ActionResult{
+			UnitID:            payload.UnitID,
+			SpaceID:           payload.SpaceID,
+			QueuedOperationID: payload.QueuedOperationID,
+			ActionResultBaseMeta: api.ActionResultMeta{
+				Action:    api.ActionApply,
+				Result:    api.ActionResultNone,
+				Status:    api.ActionStatusProgressing,
+				Message:   fmt.Sprintf("Updating DNS for %s → %s", cluster.Spec.Ingress.Domain, publicIP),
+				StartedAt: startTime,
+			},
+		})
+		if err := b.upsertDNSRecord(awsCtx, cluster.Spec.Ingress.Domain, publicIP); err != nil {
+			log.Printf("[WARN] Failed to update DNS record: %v", err)
+		}
+	}
+
+	// Step 5: Wait for workers to reconnect
+	_ = ctx.SendStatus(&api.ActionResult{
+		UnitID:            payload.UnitID,
+		SpaceID:           payload.SpaceID,
+		QueuedOperationID: payload.QueuedOperationID,
+		ActionResultBaseMeta: api.ActionResultMeta{
+			Action:    api.ActionApply,
+			Result:    api.ActionResultNone,
+			Status:    api.ActionStatusProgressing,
+			Message:   "Waiting for k3s and workers to reconnect",
+			StartedAt: startTime,
+		},
+	})
+
+	ready := b.pollInstanceReady(ctx, payload, startTime, ec2c, instanceID, 5*time.Minute)
+
+	// Build updated LiveState
+	ls := LiveState{
+		InstanceID:      instanceID,
+		PublicIP:        publicIP,
+		PrivateIP:       privateIP,
+		State:           "running",
+		LaunchTime:      existing.LaunchTime,
+		SecurityGroupID: existing.SecurityGroupID,
+		WorkerID:        existing.WorkerID,
+		WorkerConnected: ready,
+		K3sReady:        ready,
+		DNSRecord:       existing.DNSRecord,
+	}
+	liveStateJSON, _ := json.Marshal(ls)
+
+	message := fmt.Sprintf("Instance %s resized to %s at %s", instanceID, desiredType, publicIP)
+	if !ready {
+		message = fmt.Sprintf("Instance %s resized to %s at %s (still booting)", instanceID, desiredType, publicIP)
+	}
+
+	terminatedAt := time.Now()
+	return ctx.SendStatus(&api.ActionResult{
+		UnitID:            payload.UnitID,
+		SpaceID:           payload.SpaceID,
+		QueuedOperationID: payload.QueuedOperationID,
+		ActionResultBaseMeta: api.ActionResultMeta{
+			Action:       api.ActionApply,
+			Result:       api.ActionResultApplyCompleted,
+			Status:       api.ActionStatusCompleted,
+			Message:      message,
+			StartedAt:    startTime,
+			TerminatedAt: &terminatedAt,
+		},
+		Data:      payload.Data,
+		LiveData:  payload.Data,
+		LiveState: liveStateJSON,
+	})
 }
 
 // getSubnetVPC resolves the VPC ID from the configured subnet.
