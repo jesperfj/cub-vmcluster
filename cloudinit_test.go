@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestRenderUserData(t *testing.T) {
+func TestRenderUserDataIngressEnabled(t *testing.T) {
 	cluster := &VMCluster{
 		APIVersion: "demo.confighub.com/v1alpha1",
 		Kind:       "VMCluster",
@@ -39,14 +39,15 @@ func TestRenderUserData(t *testing.T) {
 		t.Fatalf("renderUserData failed: %v", err)
 	}
 
-	// Verify key content is present
-	checks := []struct {
+	mustContain := []struct {
 		name string
 		want string
 	}{
 		{"shebang", "#!/bin/bash"},
 		{"k3s version", "v1.35.2+k3s1"},
 		{"tls-san domain", "--tls-san test.demo.example.com"},
+		{"disable metrics-server", "--disable metrics-server"},
+		{"disable servicelb", "--disable servicelb"},
 		{"worker image", "ghcr.io/confighubai/confighub-worker:latest"},
 		{"confighub url", "https://app.confighub.com"},
 		{"worker id", "wkr_test"},
@@ -56,28 +57,38 @@ func TestRenderUserData(t *testing.T) {
 		{"letsencrypt email", "ops@example.com"},
 		{"ready tag", `tag_status "ready"`},
 	}
-
-	for _, c := range checks {
+	for _, c := range mustContain {
 		if !strings.Contains(userData, c.want) {
 			t.Errorf("%s: expected %q in user-data, not found", c.name, c.want)
 		}
 	}
+
+	mustNotContain := []struct {
+		name string
+		bad  string
+	}{
+		{"traefik not disabled", "--disable traefik"},
+	}
+	for _, c := range mustNotContain {
+		if strings.Contains(userData, c.bad) {
+			t.Errorf("%s: did not expect %q in user-data", c.name, c.bad)
+		}
+	}
 }
 
-func TestRenderUserDataNoTLS(t *testing.T) {
+func TestRenderUserDataNoIngress(t *testing.T) {
 	cluster := &VMCluster{
 		APIVersion: "demo.confighub.com/v1alpha1",
 		Kind:       "VMCluster",
-		Metadata:   VMClusterMeta{Name: "no-tls"},
+		Metadata:   VMClusterMeta{Name: "no-ingress"},
 		Spec: VMClusterSpec{
-			K3sVersion: "v1.30.0+k3s1",
+			K3sVersion: "v1.35.2+k3s1",
 			Ingress: IngressSpec{
-				Domain: "notls.example.com",
-				TLS:    TLSSpec{Enabled: false},
+				Enabled: false,
 			},
 			Worker: WorkerSpec{
 				ConfigHubURL:  "https://app.confighub.com",
-				WorkerID:      "wkr_notls",
+				WorkerID:      "wkr_noing",
 				WorkerSecret:  "ch_secret",
 				ProviderTypes: []string{"Kubernetes"},
 			},
@@ -89,7 +100,29 @@ func TestRenderUserDataNoTLS(t *testing.T) {
 		t.Fatalf("renderUserData failed: %v", err)
 	}
 
-	if strings.Contains(userData, "cert-manager") {
-		t.Error("expected no cert-manager when TLS disabled")
+	mustContain := []struct {
+		name string
+		want string
+	}{
+		{"disable traefik", "--disable traefik"},
+		{"disable metrics-server", "--disable metrics-server"},
+		{"disable servicelb", "--disable servicelb"},
+	}
+	for _, c := range mustContain {
+		if !strings.Contains(userData, c.want) {
+			t.Errorf("%s: expected %q in user-data, not found", c.name, c.want)
+		}
+	}
+
+	mustNotContain := []struct {
+		name string
+		bad  string
+	}{
+		{"no cert-manager", "cert-manager"},
+	}
+	for _, c := range mustNotContain {
+		if strings.Contains(userData, c.bad) {
+			t.Errorf("%s: did not expect %q in user-data", c.name, c.bad)
+		}
 	}
 }

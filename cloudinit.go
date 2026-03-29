@@ -18,9 +18,9 @@ type CloudInitParams struct {
 	WorkerID      string
 	WorkerSecret  string
 	ProviderTypes string
-	IngressDomain string
-	TLSEnabled    bool
-	TLSEmail      string
+	IngressEnabled bool
+	IngressDomain  string
+	TLSEmail       string
 	WorkerImage   string
 
 	// VMCluster worker self-install
@@ -62,8 +62,8 @@ func renderUserData(cluster *VMCluster, workerID, workerSecret string, bridge *V
 		WorkerID:      workerID,
 		WorkerSecret:  workerSecret,
 		ProviderTypes: strings.Join(cluster.Spec.Worker.ProviderTypes, ","),
-		IngressDomain: cluster.Spec.Ingress.Domain,
-		TLSEnabled:    cluster.Spec.Ingress.TLS.Enabled,
+		IngressEnabled: cluster.Spec.Ingress.Enabled,
+		IngressDomain:  cluster.Spec.Ingress.Domain,
 		TLSEmail:      cluster.Spec.Ingress.TLS.Email,
 		WorkerImage:   workerImage,
 

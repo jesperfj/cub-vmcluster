@@ -6,8 +6,11 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
-# --- Install AWS CLI (not present on Ubuntu by default) ---
-snap install aws-cli --classic 2>/dev/null || apt-get install -y awscli 2>/dev/null || true
+# --- Install AWS CLI (standalone, no snap overhead) ---
+curl -sf "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install 2>/dev/null || true
+rm -rf /tmp/awscliv2.zip /tmp/aws
 
 # --- Metadata helpers ---
 TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
@@ -24,8 +27,16 @@ tag_status() {
 tag_status "downloading-k3s"
 
 # --- Install k3s ---
+K3S_ARGS="server --write-kubeconfig-mode 644 --disable metrics-server --disable servicelb"
+K3S_ARGS="$K3S_ARGS --tls-san $PUBLIC_IP"
+{{if .IngressEnabled}}
+K3S_ARGS="$K3S_ARGS --tls-san {{.IngressDomain}}"
+{{else}}
+K3S_ARGS="$K3S_ARGS --disable traefik"
+{{end}}
+
 curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{.K3sVersion}}" \
-  INSTALL_K3S_EXEC="server --tls-san $PUBLIC_IP --tls-san {{.IngressDomain}} --write-kubeconfig-mode 644" sh -
+  INSTALL_K3S_EXEC="$K3S_ARGS" sh -
 
 tag_status "waiting-for-k3s"
 
@@ -136,7 +147,7 @@ spec:
 VMCMANIFEST
 {{end}}
 
-{{if .TLSEnabled}}
+{{if .IngressEnabled}}
 tag_status "deploying-cert-manager"
 
 # --- Deploy cert-manager ---
