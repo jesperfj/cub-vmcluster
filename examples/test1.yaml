@@ -14,9 +14,6 @@ spec:
       enabled: true
       email: ops@confighub.com
   worker:
-    confighubURL: https://hub.confighub.com
-    slug: test1-worker
-    spaceSlug: demo-clusters
-    providerTypes:
-      - Kubernetes
+    name: demo-clusters/test1-worker
+    # config defaults to demo-clusters/test1-worker-config
   installVMClusterWorker: true

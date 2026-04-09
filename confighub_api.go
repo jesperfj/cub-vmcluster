@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 
@@ -12,7 +13,8 @@ import (
 
 // ConfigHubClient wraps the generated API client with worker authentication.
 type ConfigHubClient struct {
-	client *goclientnew.ClientWithResponses
+	client       *goclientnew.ClientWithResponses
+	spaceIDCache map[string]openapi_types.UUID
 }
 
 // NewConfigHubClient authenticates as a worker and returns an API client.
@@ -32,7 +34,10 @@ func NewConfigHubClient(serverURL, workerID, workerSecret string) (*ConfigHubCli
 		return nil, fmt.Errorf("failed to create API client: %w", err)
 	}
 
-	return &ConfigHubClient{client: client}, nil
+	return &ConfigHubClient{
+		client:       client,
+		spaceIDCache: make(map[string]openapi_types.UUID),
+	}, nil
 }
 
 // WorkerCredentials holds the ID and secret needed to start a cub-worker.
@@ -43,14 +48,14 @@ type WorkerCredentials struct {
 
 // EnsureWorker creates a worker if it doesn't exist, or returns the existing one.
 // On create, the secret is returned. On existing, secret must come from LiveState.
+// The worker is created with SupportedConfigTypes so that targets can be created against it
+// before the worker connects.
 func (c *ConfigHubClient) EnsureWorker(ctx context.Context, spaceSlug, workerSlug string) (*WorkerCredentials, bool, error) {
-	// Resolve space ID from slug
 	spaceID, err := c.resolveSpaceID(ctx, spaceSlug)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to resolve space %q: %w", spaceSlug, err)
 	}
 
-	// Try to create with AllowExists
 	allowExists := "true"
 	params := &goclientnew.CreateBridgeWorkerParams{
 		AllowExists: &allowExists,
@@ -59,6 +64,16 @@ func (c *ConfigHubClient) EnsureWorker(ctx context.Context, spaceSlug, workerSlu
 	resp, err := c.client.CreateBridgeWorkerWithResponse(ctx, spaceID, params,
 		goclientnew.CreateBridgeWorkerJSONRequestBody{
 			Slug: workerSlug,
+			ProvidedInfo: &goclientnew.WorkerInfo{
+				BridgeWorkerInfo: &goclientnew.BridgeWorkerInfo{
+					SupportedConfigTypes: []goclientnew.SupportedConfigType{
+						{
+							ProviderType:  "Kubernetes",
+							ToolchainType: "Kubernetes/YAML",
+						},
+					},
+				},
+			},
 		},
 	)
 	if err != nil {
@@ -77,8 +92,70 @@ func (c *ConfigHubClient) EnsureWorker(ctx context.Context, spaceSlug, workerSlu
 	return nil, false, fmt.Errorf("unexpected response status: %d %s", resp.StatusCode(), string(resp.Body))
 }
 
-// resolveSpaceID looks up a space by slug and returns its UUID.
+// EnsureTarget creates a target if it doesn't exist, or returns the existing one.
+func (c *ConfigHubClient) EnsureTarget(ctx context.Context, spaceSlug, targetSlug string, bridgeWorkerID openapi_types.UUID) (*goclientnew.Target, error) {
+	spaceID, err := c.resolveSpaceID(ctx, spaceSlug)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve space %q: %w", spaceSlug, err)
+	}
+
+	allowExists := "true"
+	params := &goclientnew.CreateTargetParams{
+		AllowExists: &allowExists,
+	}
+
+	resp, err := c.client.CreateTargetWithResponse(ctx, spaceID, params,
+		goclientnew.CreateTargetJSONRequestBody{
+			Slug:           targetSlug,
+			BridgeWorkerID: bridgeWorkerID,
+			ProviderType:   "Kubernetes",
+			ToolchainType:  "Kubernetes/YAML",
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create target: %w", err)
+	}
+	if resp.JSON200 == nil {
+		return nil, fmt.Errorf("unexpected response status: %d %s", resp.StatusCode(), string(resp.Body))
+	}
+	return resp.JSON200, nil
+}
+
+// EnsureConfigUnit creates a config unit if it doesn't exist, or returns the existing one.
+func (c *ConfigHubClient) EnsureConfigUnit(ctx context.Context, spaceSlug, unitSlug string, targetID openapi_types.UUID, manifestData string) (*goclientnew.Unit, error) {
+	spaceID, err := c.resolveSpaceID(ctx, spaceSlug)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve space %q: %w", spaceSlug, err)
+	}
+
+	allowExists := "true"
+	params := &goclientnew.CreateUnitParams{
+		AllowExists: &allowExists,
+	}
+
+	resp, err := c.client.CreateUnitWithResponse(ctx, spaceID, params,
+		goclientnew.CreateUnitJSONRequestBody{
+			Slug:          unitSlug,
+			ToolchainType: "Kubernetes/YAML",
+			TargetID:      &targetID,
+			Data:          base64.StdEncoding.EncodeToString([]byte(manifestData)),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create config unit: %w", err)
+	}
+	if resp.JSON200 == nil {
+		return nil, fmt.Errorf("unexpected response status: %d %s", resp.StatusCode(), string(resp.Body))
+	}
+	return resp.JSON200, nil
+}
+
+// resolveSpaceID looks up a space by slug and returns its UUID. Results are cached.
 func (c *ConfigHubClient) resolveSpaceID(ctx context.Context, spaceSlug string) (openapi_types.UUID, error) {
+	if id, ok := c.spaceIDCache[spaceSlug]; ok {
+		return id, nil
+	}
+
 	resp, err := c.client.ListSpacesWithResponse(ctx, &goclientnew.ListSpacesParams{})
 	if err != nil {
 		return openapi_types.UUID{}, err
@@ -88,6 +165,7 @@ func (c *ConfigHubClient) resolveSpaceID(ctx context.Context, spaceSlug string) 
 	}
 	for _, es := range *resp.JSON200 {
 		if es.Space != nil && es.Space.Slug == spaceSlug {
+			c.spaceIDCache[spaceSlug] = es.Space.SpaceID
 			return es.Space.SpaceID, nil
 		}
 	}

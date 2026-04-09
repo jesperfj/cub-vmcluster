@@ -26,15 +26,18 @@ func TestRenderUserDataIngressEnabled(t *testing.T) {
 				},
 			},
 			Worker: WorkerSpec{
-				ConfigHubURL:  "https://app.confighub.com",
-				WorkerID:      "wkr_test",
-				WorkerSecret:  "ch_testsecret",
-				ProviderTypes: []string{"Kubernetes"},
+				Name: "demo/test-worker",
 			},
 		},
 	}
 
-	userData, err := renderUserData(cluster, cluster.Spec.Worker.WorkerID, cluster.Spec.Worker.WorkerSecret, &VMClusterBridge{})
+	manifest := generateWorkerManifest(WorkerManifestParams{
+		ConfigHubURL: "https://app.confighub.com",
+		WorkerID:     "wkr_test",
+		WorkerSecret: "ch_testsecret",
+	})
+
+	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{})
 	if err != nil {
 		t.Fatalf("renderUserData failed: %v", err)
 	}
@@ -52,7 +55,6 @@ func TestRenderUserDataIngressEnabled(t *testing.T) {
 		{"confighub url", "https://app.confighub.com"},
 		{"worker id", "wkr_test"},
 		{"worker secret", "ch_testsecret"},
-		{"provider types", "Kubernetes"},
 		{"cert-manager", "cert-manager.yaml"},
 		{"letsencrypt email", "ops@example.com"},
 		{"ready tag", `tag_status "ready"`},
@@ -87,15 +89,18 @@ func TestRenderUserDataNoIngress(t *testing.T) {
 				Enabled: false,
 			},
 			Worker: WorkerSpec{
-				ConfigHubURL:  "https://app.confighub.com",
-				WorkerID:      "wkr_noing",
-				WorkerSecret:  "ch_secret",
-				ProviderTypes: []string{"Kubernetes"},
+				Name: "demo/no-ingress-worker",
 			},
 		},
 	}
 
-	userData, err := renderUserData(cluster, cluster.Spec.Worker.WorkerID, cluster.Spec.Worker.WorkerSecret, &VMClusterBridge{})
+	manifest := generateWorkerManifest(WorkerManifestParams{
+		ConfigHubURL: "https://app.confighub.com",
+		WorkerID:     "wkr_noing",
+		WorkerSecret: "ch_secret",
+	})
+
+	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{})
 	if err != nil {
 		t.Fatalf("renderUserData failed: %v", err)
 	}
@@ -123,6 +128,84 @@ func TestRenderUserDataNoIngress(t *testing.T) {
 	for _, c := range mustNotContain {
 		if strings.Contains(userData, c.bad) {
 			t.Errorf("%s: did not expect %q in user-data", c.name, c.bad)
+		}
+	}
+}
+
+func TestGenerateWorkerManifest(t *testing.T) {
+	manifest := generateWorkerManifest(WorkerManifestParams{
+		ConfigHubURL: "https://hub.confighub.com",
+		WorkerID:     "wkr_abc123",
+		WorkerSecret: "ch_secret456",
+	})
+
+	mustContain := []struct {
+		name string
+		want string
+	}{
+		{"namespace", "kind: Namespace"},
+		{"service account", "kind: ServiceAccount"},
+		{"cluster role binding", "kind: ClusterRoleBinding"},
+		{"secret", "kind: Secret"},
+		{"deployment", "kind: Deployment"},
+		{"default image", "ghcr.io/confighubai/confighub-worker:latest"},
+		{"confighub url", "https://hub.confighub.com"},
+		{"worker id in secret", "wkr_abc123"},
+		{"worker secret in secret", "ch_secret456"},
+		{"envFrom secretRef", "secretRef"},
+	}
+	for _, c := range mustContain {
+		if !strings.Contains(manifest, c.want) {
+			t.Errorf("%s: expected %q in manifest, not found", c.name, c.want)
+		}
+	}
+}
+
+func TestGenerateWorkerManifestCustomImage(t *testing.T) {
+	manifest := generateWorkerManifest(WorkerManifestParams{
+		ConfigHubURL: "https://hub.confighub.com",
+		WorkerID:     "wkr_test",
+		WorkerSecret: "ch_test",
+		WorkerImage:  "my-registry.com/worker:v2",
+	})
+
+	if !strings.Contains(manifest, "my-registry.com/worker:v2") {
+		t.Error("expected custom image in manifest")
+	}
+	if strings.Contains(manifest, "ghcr.io/confighubai/confighub-worker:latest") {
+		t.Error("did not expect default image when custom image is set")
+	}
+}
+
+func TestParseSlashNotation(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantSpace string
+		wantName  string
+		wantErr   bool
+	}{
+		{"demo/test-worker", "demo", "test-worker", false},
+		{"my-space/my-unit-config", "my-space", "my-unit-config", false},
+		{"noslash", "", "", true},
+		{"/no-space", "", "", true},
+		{"no-name/", "", "", true},
+		{"", "", "", true},
+	}
+	for _, tc := range tests {
+		space, name, err := parseSlashNotation(tc.input)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseSlashNotation(%q): expected error, got space=%q name=%q", tc.input, space, name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseSlashNotation(%q): unexpected error: %v", tc.input, err)
+			continue
+		}
+		if space != tc.wantSpace || name != tc.wantName {
+			t.Errorf("parseSlashNotation(%q): got space=%q name=%q, want space=%q name=%q",
+				tc.input, space, name, tc.wantSpace, tc.wantName)
 		}
 	}
 }

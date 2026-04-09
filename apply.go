@@ -14,8 +14,18 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 	"github.com/confighub/sdk/core/worker/api"
+	googleuuid "github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
+
+// ConfigHubSetupResult holds the resources created/resolved during setup.
+type ConfigHubSetupResult struct {
+	WorkerID     string
+	WorkerSecret string
+	TargetID     string
+	ConfigUnitID string
+	Manifest     string
+}
 
 func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload) error {
 	startTime := time.Now()
@@ -78,6 +88,20 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 					return b.resizeInstance(ctx, payload, startTime, ec2c, &cluster, &existing, desiredType)
 				}
 
+				// Ensure ConfigHub resources exist (idempotent)
+				setup, err := b.setupConfigHubResources(ctx.Context(), ctx, payload, startTime, &cluster, &existing)
+				if err != nil {
+					return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
+				}
+
+				// Update LiveState with ConfigHub resource IDs
+				existing.TargetID = setup.TargetID
+				existing.ConfigUnitID = setup.ConfigUnitID
+				if setup.WorkerSecret != "" {
+					existing.WorkerSecret = setup.WorkerSecret
+				}
+				liveStateJSON, _ := json.Marshal(existing)
+
 				// No changes — report synced
 				terminatedAt := time.Now()
 				return ctx.SendStatus(&api.ActionResult{
@@ -94,7 +118,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 					},
 					Data:      payload.Data,
 					LiveData:  payload.Data,
-					LiveState: payload.LiveState,
+					LiveState: liveStateJSON,
 				})
 			}
 		}
@@ -138,14 +162,14 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	}
 	log.Printf("[INFO] Security group: %s", sgID)
 
-	// Step 2: Resolve worker credentials
-	workerID, workerSecret, err := b.resolveWorkerCredentials(awsCtx, ctx, payload, startTime, &cluster, &existing)
+	// Step 2: Setup ConfigHub resources (worker, target, config unit)
+	setup, err := b.setupConfigHubResources(awsCtx, ctx, payload, startTime, &cluster, &existing)
 	if err != nil {
-		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to resolve worker credentials: %v", err))
+		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
 	}
 
 	// Step 3: Render cloud-init
-	userData, err := renderUserData(&cluster, workerID, workerSecret, b)
+	userData, err := renderUserData(&cluster, setup.Manifest, b)
 	if err != nil {
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to render cloud-init: %v", err))
 	}
@@ -234,7 +258,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	instanceID := aws.ToString(instance.InstanceId)
 	log.Printf("[INFO] Instance launched: %s", instanceID)
 
-	// Step 5: Wait for instance running
+	// Step 6: Wait for instance running
 	_ = ctx.SendStatus(&api.ActionResult{
 		UnitID:            payload.UnitID,
 		SpaceID:           payload.SpaceID,
@@ -268,7 +292,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	privateIP := aws.ToString(inst.PrivateIpAddress)
 	log.Printf("[INFO] Instance %s running at %s", instanceID, publicIP)
 
-	// Step 6: DNS record
+	// Step 7: DNS record
 	if cluster.Spec.Ingress.Domain != "" && b.hostedZoneID != "" {
 		_ = ctx.SendStatus(&api.ActionResult{
 			UnitID:            payload.UnitID,
@@ -289,7 +313,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		}
 	}
 
-	// Step 7: Poll for readiness
+	// Step 8: Poll for readiness
 	_ = ctx.SendStatus(&api.ActionResult{
 		UnitID:            payload.UnitID,
 		SpaceID:           payload.SpaceID,
@@ -313,10 +337,13 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		State:           "running",
 		LaunchTime:      inst.LaunchTime.Format(time.RFC3339),
 		SecurityGroupID: sgID,
-		WorkerID:        workerID,
+		WorkerID:        setup.WorkerID,
+		WorkerSecret:    setup.WorkerSecret,
 		WorkerConnected: ready,
 		K3sReady:        ready,
 		DNSRecord:       cluster.Spec.Ingress.Domain,
+		TargetID:        setup.TargetID,
+		ConfigUnitID:    setup.ConfigUnitID,
 	}
 	liveStateJSON, _ := json.Marshal(ls)
 
@@ -344,31 +371,35 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	})
 }
 
-// resolveWorkerCredentials determines the worker ID and secret for the on-instance cub-worker.
-// If slug + spaceSlug are specified, it creates/finds the worker via the ConfigHub API.
-// If raw workerID + workerSecret are specified (legacy), it uses those directly.
-// On re-apply, credentials are recovered from LiveState.
-func (b *VMClusterBridge) resolveWorkerCredentials(
+// setupConfigHubResources creates or resolves the worker, target, and config unit.
+func (b *VMClusterBridge) setupConfigHubResources(
 	ctx context.Context,
 	bctx api.BridgeContext,
 	payload api.BridgePayload,
 	startTime time.Time,
 	cluster *VMCluster,
 	existing *LiveState,
-) (workerID, workerSecret string, err error) {
-	spec := cluster.Spec.Worker
-
-	// Legacy: raw credentials in spec
-	if spec.WorkerID != "" && spec.WorkerSecret != "" {
-		return spec.WorkerID, spec.WorkerSecret, nil
+) (*ConfigHubSetupResult, error) {
+	// Parse worker.name -> space, workerSlug
+	spaceSlug, workerSlug, err := parseSlashNotation(cluster.Spec.Worker.Name)
+	if err != nil {
+		return nil, fmt.Errorf("invalid worker.name: %w", err)
 	}
 
-	// New flow: slug + spaceSlug
-	if spec.Slug == "" || spec.SpaceSlug == "" {
-		return "", "", fmt.Errorf("worker.slug and worker.spaceSlug are required (or provide legacy workerID + workerSecret)")
+	// Parse or derive config unit slug
+	var configUnitSlug string
+	if cluster.Spec.Worker.Config != "" {
+		_, configUnitSlug, err = parseSlashNotation(cluster.Spec.Worker.Config)
+		if err != nil {
+			return nil, fmt.Errorf("invalid worker.config: %w", err)
+		}
+	} else {
+		configUnitSlug = cluster.Metadata.Name + "-worker-config"
 	}
 
-	// Create or find the worker via the ConfigHub API
+	// Derive target slug
+	targetSlug := cluster.Metadata.Name + "-target"
+
 	_ = bctx.SendStatus(&api.ActionResult{
 		UnitID:            payload.UnitID,
 		SpaceID:           payload.SpaceID,
@@ -377,31 +408,69 @@ func (b *VMClusterBridge) resolveWorkerCredentials(
 			Action:    api.ActionApply,
 			Result:    api.ActionResultNone,
 			Status:    api.ActionStatusProgressing,
-			Message:   fmt.Sprintf("Creating worker %s in space %s", spec.Slug, spec.SpaceSlug),
+			Message:   fmt.Sprintf("Setting up ConfigHub resources (worker %s, target %s)", workerSlug, targetSlug),
 			StartedAt: startTime,
 		},
 	})
 
 	apiClient, err := NewConfigHubClient(b.confighubURL, b.confighubID, b.confighubSecret)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to authenticate to ConfigHub API: %w", err)
+		return nil, fmt.Errorf("failed to authenticate to ConfigHub API: %w", err)
 	}
 
-	creds, created, err := apiClient.EnsureWorker(ctx, spec.SpaceSlug, spec.Slug)
+	// Step 1: Ensure worker exists
+	creds, created, err := apiClient.EnsureWorker(ctx, spaceSlug, workerSlug)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to ensure worker: %w", err)
+		return nil, fmt.Errorf("failed to ensure worker: %w", err)
 	}
 
+	workerSecret := creds.Secret
 	if created {
-		log.Printf("[INFO] Created worker %s (ID: %s)", spec.Slug, creds.WorkerID)
+		log.Printf("[INFO] Created worker %s (ID: %s)", workerSlug, creds.WorkerID)
 	} else {
-		log.Printf("[INFO] Worker %s already exists (ID: %s)", spec.Slug, creds.WorkerID)
-		if creds.Secret == "" {
-			return "", "", fmt.Errorf("worker %s already exists but secret is not available (was it created outside of cub-vmcluster?)", spec.Slug)
+		log.Printf("[INFO] Worker %s already exists (ID: %s)", workerSlug, creds.WorkerID)
+		// Recover secret from LiveState if the worker already existed
+		if workerSecret == "" && existing.WorkerSecret != "" {
+			workerSecret = existing.WorkerSecret
+		}
+		if workerSecret == "" {
+			return nil, fmt.Errorf("worker %s already exists but secret is not available; delete and recreate the worker", workerSlug)
 		}
 	}
 
-	return creds.WorkerID, creds.Secret, nil
+	// Step 2: Ensure target exists
+	workerUUID, err := googleuuid.Parse(creds.WorkerID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse worker ID as UUID: %w", err)
+	}
+
+	target, err := apiClient.EnsureTarget(ctx, spaceSlug, targetSlug, workerUUID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure target: %w", err)
+	}
+	log.Printf("[INFO] Target %s (ID: %s)", targetSlug, target.TargetID.String())
+
+	// Step 3: Generate worker manifest
+	manifest := generateWorkerManifest(WorkerManifestParams{
+		ConfigHubURL: b.confighubURL,
+		WorkerID:     creds.WorkerID,
+		WorkerSecret: workerSecret,
+	})
+
+	// Step 4: Ensure config unit exists
+	unit, err := apiClient.EnsureConfigUnit(ctx, spaceSlug, configUnitSlug, target.TargetID, manifest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure config unit: %w", err)
+	}
+	log.Printf("[INFO] Config unit %s (ID: %s)", configUnitSlug, unit.UnitID.String())
+
+	return &ConfigHubSetupResult{
+		WorkerID:     creds.WorkerID,
+		WorkerSecret: workerSecret,
+		TargetID:     target.TargetID.String(),
+		ConfigUnitID: unit.UnitID.String(),
+		Manifest:     manifest,
+	}, nil
 }
 
 // resizeInstance stops the instance, changes its type, starts it, and updates DNS.
@@ -555,9 +624,12 @@ func (b *VMClusterBridge) resizeInstance(
 		LaunchTime:      existing.LaunchTime,
 		SecurityGroupID: existing.SecurityGroupID,
 		WorkerID:        existing.WorkerID,
+		WorkerSecret:    existing.WorkerSecret,
 		WorkerConnected: ready,
 		K3sReady:        ready,
 		DNSRecord:       existing.DNSRecord,
+		TargetID:        existing.TargetID,
+		ConfigUnitID:    existing.ConfigUnitID,
 	}
 	liveStateJSON, _ := json.Marshal(ls)
 

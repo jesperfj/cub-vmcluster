@@ -308,7 +308,7 @@ cmd_init() {
     prompt WORKER_SLUG "Worker slug" "vmcluster-controller"
 
     log_info "Creating worker '$WORKER_SLUG' in space '$WORKER_SPACE'..."
-    cub worker create "$WORKER_SLUG" --space "$WORKER_SPACE" --allow-exists 2>&1 || {
+    cub worker create "$WORKER_SLUG" --space "$WORKER_SPACE" --allow-exists --standard 2>&1 || {
         die "Failed to create worker"
     }
 
@@ -322,6 +322,14 @@ cmd_init() {
         die "Failed to parse worker credentials"
     fi
     log_success "Worker: $WORKER_SLUG ($WORKER_ID)"
+
+    # --- Create target for the vmcluster-controller worker ---
+    CONTROLLER_TARGET="${WORKER_SLUG}"
+    log_info "Creating target '$CONTROLLER_TARGET' for worker '$WORKER_SLUG'..."
+    cub target create "$CONTROLLER_TARGET" "{}" "$WORKER_SLUG" --space "$WORKER_SPACE" --allow-exists 2>&1 || {
+        die "Failed to create target"
+    }
+    log_success "Target: $CONTROLLER_TARGET"
 
     # --- Write .env ---
     cat > "$ENV_FILE" <<EOF
@@ -375,7 +383,6 @@ EOF
     fi
 
     CLUSTER_WORKER_SLUG="${CLUSTER_NAME}-worker"
-    VMCLUSTER_TARGET=$(cub target list --space "$WORKER_SPACE" --jq ".[].Slug" 2>/dev/null | grep -i vmcluster | head -1 || echo "")
 
     CLUSTER_YAML="apiVersion: demo.confighub.com/v1alpha1
 kind: VMCluster
@@ -393,32 +400,25 @@ spec:
       enabled: $(if [[ -n "$CLUSTER_DOMAIN" ]]; then echo "true"; else echo "false"; fi)
       email: ops@confighub.com
   worker:
-    confighubURL: ${CUB_SERVER}
-    slug: ${CLUSTER_WORKER_SLUG}
-    spaceSlug: ${WORKER_SPACE}
-    providerTypes:
-      - Kubernetes
+    name: ${WORKER_SPACE}/${CLUSTER_WORKER_SLUG}
+    config: ${WORKER_SPACE}/${CLUSTER_WORKER_SLUG}-config
   installVMClusterWorker: true"
 
     log_info "Creating unit '${CLUSTER_NAME}' in space '${WORKER_SPACE}'..."
-    TARGET_FLAG=""
-    if [[ -n "$VMCLUSTER_TARGET" ]]; then
-        TARGET_FLAG="--target $VMCLUSTER_TARGET"
-    fi
     echo "$CLUSTER_YAML" | cub unit create --space "$WORKER_SPACE" "$CLUSTER_NAME" - \
-        $TARGET_FLAG --allow-exists 2>&1 || {
+        --target "$CONTROLLER_TARGET" --allow-exists 2>&1 || {
         log_warn "Failed to create unit. You can create it manually in the ConfigHub UI."
     }
     log_success "Unit created"
 
     # --- Summary ---
-    EXPECTED_TARGET="${WORKER_SLUG}-vmcluster-kubernetes-yaml-default"
     echo ""
     echo "============================================"
     echo -e "  ${GREEN}${BOLD}Init complete${NC}"
     echo "============================================"
     echo ""
     echo "  Worker:   $WORKER_SLUG ($WORKER_ID)"
+    echo "  Target:   $CONTROLLER_TARGET"
     echo "  Space:    $WORKER_SPACE"
     echo "  Subnet:   $SUBNET_ID"
     echo "  Profile:  $INSTANCE_PROFILE"
@@ -431,9 +431,7 @@ spec:
     echo "     $DOCKER_CMD"
     echo ""
     echo "  2. Open ConfigHub and verify the worker is connected"
-    echo "  3. Assign the '${CLUSTER_NAME}' unit to the target:"
-    echo "     ${EXPECTED_TARGET}"
-    echo "  4. Apply the unit to provision your first cluster"
+    echo "  3. Apply the '${CLUSTER_NAME}' unit to provision your first cluster"
     echo ""
 }
 
@@ -916,6 +914,75 @@ cmd_resize() {
 
 # --- Cluster access commands ---
 
+cmd_destroy() {
+    require_env
+    local cluster_name="${1:?Usage: vmctl destroy <cluster-name>}"
+
+    echo ""
+    log_info "Finding instance for cluster '$cluster_name'..."
+
+    # Find instance (any non-terminated state)
+    local result
+    result=$(aws ec2 describe-instances --region "$REGION" \
+        --filters \
+            "Name=tag:confighub:cluster-name,Values=$cluster_name" \
+            "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+        --query "Reservations[].Instances[].[InstanceId,PublicIpAddress,State.Name]" \
+        --output text | head -1)
+
+    if [[ -z "$result" ]]; then
+        log_warn "No active instance found for cluster '$cluster_name'"
+    else
+        local instance_id public_ip state
+        instance_id=$(echo "$result" | awk '{print $1}')
+        public_ip=$(echo "$result" | awk '{print $2}')
+        state=$(echo "$result" | awk '{print $3}')
+        log_info "Instance: $instance_id ($state, IP: ${public_ip:-none})"
+
+        if ! confirm "Terminate instance $instance_id?"; then
+            die "Aborted"
+        fi
+
+        # Terminate
+        log_info "Terminating instance $instance_id..."
+        aws ec2 terminate-instances --region "$REGION" --instance-ids "$instance_id" >/dev/null
+        log_info "Waiting for termination..."
+        aws ec2 wait instance-terminated --region "$REGION" --instance-ids "$instance_id" 2>/dev/null || true
+        log_success "Instance terminated"
+
+        # Delete security group
+        local sg_id
+        sg_id=$(aws ec2 describe-security-groups --region "$REGION" \
+            --filters "Name=group-name,Values=${cluster_name}-sg" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+        if [[ "$sg_id" != "None" && -n "$sg_id" ]]; then
+            log_info "Deleting security group $sg_id..."
+            aws ec2 delete-security-group --region "$REGION" --group-id "$sg_id" 2>/dev/null || \
+                log_warn "Failed to delete security group $sg_id (may still be in use)"
+        fi
+
+        # Delete DNS records
+        if [[ -n "${ROUTE53_HOSTED_ZONE_ID:-}" && "$public_ip" != "None" && -n "$public_ip" ]]; then
+            ZONE_NAME=$(aws route53 get-hosted-zone --id "$ROUTE53_HOSTED_ZONE_ID" \
+                --query "HostedZone.Name" --output text | sed 's/\.$//')
+            local domain="${cluster_name}.${ZONE_NAME}"
+            log_info "Removing DNS records for $domain..."
+            aws route53 change-resource-record-sets \
+                --hosted-zone-id "$ROUTE53_HOSTED_ZONE_ID" \
+                --change-batch "{
+                    \"Changes\": [
+                        {\"Action\": \"DELETE\", \"ResourceRecordSet\": {\"Name\": \"$domain\", \"Type\": \"A\", \"TTL\": 60, \"ResourceRecords\": [{\"Value\": \"$public_ip\"}]}},
+                        {\"Action\": \"DELETE\", \"ResourceRecordSet\": {\"Name\": \"*.$domain\", \"Type\": \"A\", \"TTL\": 60, \"ResourceRecords\": [{\"Value\": \"$public_ip\"}]}}
+                    ]
+                }" >/dev/null 2>&1 || log_warn "Failed to delete DNS records (may not exist)"
+            log_success "DNS records removed"
+        fi
+    fi
+
+    log_success "Cluster '$cluster_name' destroyed"
+    echo ""
+}
+
 cmd_list() {
     require_env
     aws ec2 describe-instances --region "$REGION" \
@@ -967,6 +1034,7 @@ usage() {
     echo ""
     echo "Cluster operations:"
     echo "  list                       List running clusters"
+    echo "  destroy <name>             Terminate instance and clean up DNS/security group"
     echo "  resize <name> <type>       Resize a cluster's instance type (stop/change/start)"
     echo "  kubeconfig <name>          Get kubeconfig for a cluster"
     echo "  shell <name>               Open SSM shell to a cluster"
@@ -978,6 +1046,7 @@ case "${1:-}" in
     teardown)   shift; cmd_teardown "$@" ;;
     status)     cmd_status ;;
     list)       cmd_list ;;
+    destroy)    shift; cmd_destroy "$@" ;;
     resize)     shift; cmd_resize "$@" ;;
     kubeconfig) shift; cmd_kubeconfig "$@" ;;
     shell)      shift; cmd_shell "$@" ;;

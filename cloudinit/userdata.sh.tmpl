@@ -7,6 +7,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 # --- Install AWS CLI (standalone, no snap overhead) ---
+apt-get update -qq && apt-get install -y -qq unzip > /dev/null
 curl -sf "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
 unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install 2>/dev/null || true
@@ -53,58 +54,7 @@ tag_status "deploying-worker"
 # Ensure manifests directory exists (k3s creates it at startup but there's a race)
 mkdir -p /var/lib/rancher/k3s/server/manifests/
 cat > /var/lib/rancher/k3s/server/manifests/confighub-worker.yaml <<'MANIFEST'
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: confighub-system
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: cub-worker
-  namespace: confighub-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: cub-worker-cluster-admin
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: cluster-admin
-subjects:
-- kind: ServiceAccount
-  name: cub-worker
-  namespace: confighub-system
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: cub-worker
-  namespace: confighub-system
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: cub-worker
-  template:
-    metadata:
-      labels:
-        app: cub-worker
-    spec:
-      serviceAccountName: cub-worker
-      containers:
-      - name: cub-worker
-        image: {{.WorkerImage}}
-        env:
-        - name: CONFIGHUB_URL
-          value: "{{.ConfigHubURL}}"
-        - name: CONFIGHUB_WORKER_ID
-          value: "{{.WorkerID}}"
-        - name: CONFIGHUB_WORKER_SECRET
-          value: "{{.WorkerSecret}}"
-        - name: CONFIGHUB_WORKER_PROVIDER_TYPES
-          value: "{{.ProviderTypes}}"
+{{.WorkerManifest}}
 MANIFEST
 
 {{if .InstallVMClusterWorker}}
