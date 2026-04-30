@@ -41,8 +41,9 @@ type TLSSpec struct {
 }
 
 type WorkerSpec struct {
-	Name   string `yaml:"name"`             // "space/worker-name" slash notation
-	Config string `yaml:"config,omitempty"` // "space/unit-name", defaults to {space}/{metadata.name}-worker-config
+	Name                 string `yaml:"name"`                           // "space/worker-name" slash notation
+	Config               string `yaml:"config,omitempty"`               // "space/unit-name", defaults to {space}/{metadata.name}-worker-config
+	TenantOrganizationID string `yaml:"tenantOrganizationID,omitempty"` // External org ID (e.g. "org_xxx") set when the cluster has been reassigned to a tenant org
 }
 
 // LiveState is the JSON structure stored in the unit's LiveState field.

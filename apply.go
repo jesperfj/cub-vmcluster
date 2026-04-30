@@ -88,19 +88,25 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 					return b.resizeInstance(ctx, payload, startTime, ec2c, &cluster, &existing, desiredType)
 				}
 
-				// Ensure ConfigHub resources exist (idempotent)
-				setup, err := b.setupConfigHubResources(ctx.Context(), ctx, payload, startTime, &cluster, &existing)
-				if err != nil {
-					return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
+				// If the cluster has been reassigned to a tenant org, skip
+				// ConfigHub resource setup — the tenant org owns those resources now.
+				var liveStateJSON []byte
+				if cluster.Spec.Worker.TenantOrganizationID != "" {
+					log.Printf("[INFO] Cluster %s is leased to org %s; skipping ConfigHub resource setup",
+						cluster.Metadata.Name, cluster.Spec.Worker.TenantOrganizationID)
+					liveStateJSON, _ = json.Marshal(existing)
+				} else {
+					setup, err := b.setupConfigHubResources(ctx.Context(), ctx, payload, startTime, &cluster, &existing)
+					if err != nil {
+						return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
+					}
+					existing.TargetID = setup.TargetID
+					existing.ConfigUnitID = setup.ConfigUnitID
+					if setup.WorkerSecret != "" {
+						existing.WorkerSecret = setup.WorkerSecret
+					}
+					liveStateJSON, _ = json.Marshal(existing)
 				}
-
-				// Update LiveState with ConfigHub resource IDs
-				existing.TargetID = setup.TargetID
-				existing.ConfigUnitID = setup.ConfigUnitID
-				if setup.WorkerSecret != "" {
-					existing.WorkerSecret = setup.WorkerSecret
-				}
-				liveStateJSON, _ := json.Marshal(existing)
 
 				// No changes — report synced
 				terminatedAt := time.Now()
@@ -122,6 +128,15 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 				})
 			}
 		}
+	}
+
+	// If the cluster has been reassigned to a tenant org but no live instance exists,
+	// refuse to (re-)provision: setupConfigHubResources would write control-plane
+	// resources for a cluster the controller no longer owns.
+	if cluster.Spec.Worker.TenantOrganizationID != "" {
+		return b.sendFailed(ctx, payload, startTime,
+			fmt.Sprintf("cluster %s is leased to org %s and has no live instance; cannot provision from control plane",
+				cluster.Metadata.Name, cluster.Spec.Worker.TenantOrganizationID))
 	}
 
 	// --- Provision new cluster ---
