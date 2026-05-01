@@ -118,7 +118,7 @@ spec:
         emptyDir: {}`, p.WorkerID, p.WorkerSecret, p.WorkerImage, p.ConfigHubURL)
 }
 
-func renderUserData(cluster *VMCluster, workerManifest string, bridge *VMClusterBridge) (string, error) {
+func renderUserData(cluster *VMCluster, workerManifest string, bridge *VMClusterBridge, topts BridgeTargetOptions) (string, error) {
 	tmplData, err := cloudinitFS.ReadFile("cloudinit/userdata.sh.tmpl")
 	if err != nil {
 		return "", fmt.Errorf("failed to read userdata template: %w", err)
@@ -147,9 +147,9 @@ func renderUserData(cluster *VMCluster, workerManifest string, bridge *VMCluster
 		VMClusterWorkerID:      bridge.confighubID,
 		VMClusterWorkerSecret:  bridge.confighubSecret,
 		VMClusterWorkerImage:   vmclusterImage,
-		VMClusterSubnetID:      bridge.subnetID,
-		VMClusterHostedZoneID:  bridge.hostedZoneID,
-		AWSRegion:              cluster.Spec.Region,
+		VMClusterSubnetID:      topts.SubnetID,
+		VMClusterHostedZoneID:  topts.HostedZoneID,
+		AWSRegion:              topts.Region,
 	}
 
 	var buf bytes.Buffer

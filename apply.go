@@ -56,6 +56,11 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("unexpected kind %q, expected VMCluster", cluster.Kind))
 	}
 
+	topts := parseTargetOptions(payload.TargetOptions)
+	if topts.Region == "" {
+		return b.sendFailed(ctx, payload, startTime, "target option 'Region' is required")
+	}
+
 	// Check for existing instance in LiveState
 	var existing LiveState
 	if len(payload.LiveState) > 0 {
@@ -66,7 +71,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 
 	if existing.InstanceID != "" {
 		// Instance already exists — check if it's still running
-		ec2c, err := b.ec2Client(ctx.Context(), cluster.Spec.Region)
+		ec2c, err := b.ec2Client(ctx.Context(), topts.RoleARN, topts.Region)
 		if err != nil {
 			return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to create EC2 client: %v", err))
 		}
@@ -85,7 +90,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 				}
 
 				if currentType != desiredType {
-					return b.resizeInstance(ctx, payload, startTime, ec2c, &cluster, &existing, desiredType)
+					return b.resizeInstance(ctx, payload, startTime, ec2c, &cluster, &existing, desiredType, topts)
 				}
 
 				// If the cluster has been reassigned to a tenant org, skip
@@ -141,12 +146,9 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 
 	// --- Provision new cluster ---
 	awsCtx := ctx.Context()
-	region := cluster.Spec.Region
-	if region == "" {
-		region = "us-east-1"
-	}
+	region := topts.Region
 
-	ec2c, err := b.ec2Client(awsCtx, region)
+	ec2c, err := b.ec2Client(awsCtx, topts.RoleARN, region)
 	if err != nil {
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to create EC2 client: %v", err))
 	}
@@ -166,7 +168,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	})
 
 	// Look up the VPC from the subnet so the security group is in the right network.
-	vpcID, err := b.getSubnetVPC(awsCtx, ec2c)
+	vpcID, err := b.getSubnetVPC(awsCtx, ec2c, topts.SubnetID)
 	if err != nil {
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to resolve VPC from subnet: %v", err))
 	}
@@ -184,7 +186,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	}
 
 	// Step 3: Render cloud-init
-	userData, err := renderUserData(&cluster, setup.Manifest, b)
+	userData, err := renderUserData(&cluster, setup.Manifest, b, topts)
 	if err != nil {
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to render cloud-init: %v", err))
 	}
@@ -255,12 +257,12 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		},
 	}
 
-	if b.subnetID != "" {
-		runInput.SubnetId = aws.String(b.subnetID)
+	if topts.SubnetID != "" {
+		runInput.SubnetId = aws.String(topts.SubnetID)
 	}
 
 	// Per-VM IAM role/instance profile scoped to /cub-vmcluster/<unitID>/* in SSM.
-	profileName, err := b.ensurePerVMInstanceProfile(awsCtx, payload.UnitID.String(), region, cluster.Spec.InstallVMClusterWorker)
+	profileName, err := b.ensurePerVMInstanceProfile(awsCtx, topts.RoleARN, payload.UnitID.String(), region, cluster.Spec.InstallVMClusterWorker)
 	if err != nil {
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to ensure instance profile: %v", err))
 	}
@@ -312,7 +314,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	log.Printf("[INFO] Instance %s running at %s", instanceID, publicIP)
 
 	// Step 7: DNS record
-	if cluster.Spec.Ingress.Domain != "" && b.hostedZoneID != "" {
+	if cluster.Spec.Ingress.Domain != "" && topts.HostedZoneID != "" {
 		_ = ctx.SendStatus(&api.ActionResult{
 			UnitID:            payload.UnitID,
 			SpaceID:           payload.SpaceID,
@@ -326,7 +328,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 			},
 		})
 
-		if err := b.upsertDNSRecord(awsCtx, cluster.Spec.Ingress.Domain, publicIP); err != nil {
+		if err := b.upsertDNSRecord(awsCtx, topts.RoleARN, topts.HostedZoneID, cluster.Spec.Ingress.Domain, publicIP); err != nil {
 			log.Printf("[WARN] Failed to create DNS record: %v", err)
 			// Non-fatal — continue without DNS
 		}
@@ -501,6 +503,7 @@ func (b *VMClusterBridge) resizeInstance(
 	cluster *VMCluster,
 	existing *LiveState,
 	desiredType string,
+	topts BridgeTargetOptions,
 ) error {
 	awsCtx := ctx.Context()
 	instanceID := existing.InstanceID
@@ -600,7 +603,7 @@ func (b *VMClusterBridge) resizeInstance(
 	log.Printf("[INFO] Instance %s running at %s (was %s)", instanceID, publicIP, existing.PublicIP)
 
 	// Step 4: Update DNS if IP changed
-	if publicIP != existing.PublicIP && cluster.Spec.Ingress.Domain != "" && b.hostedZoneID != "" {
+	if publicIP != existing.PublicIP && cluster.Spec.Ingress.Domain != "" && topts.HostedZoneID != "" {
 		_ = ctx.SendStatus(&api.ActionResult{
 			UnitID:            payload.UnitID,
 			SpaceID:           payload.SpaceID,
@@ -613,7 +616,7 @@ func (b *VMClusterBridge) resizeInstance(
 				StartedAt: startTime,
 			},
 		})
-		if err := b.upsertDNSRecord(awsCtx, cluster.Spec.Ingress.Domain, publicIP); err != nil {
+		if err := b.upsertDNSRecord(awsCtx, topts.RoleARN, topts.HostedZoneID, cluster.Spec.Ingress.Domain, publicIP); err != nil {
 			log.Printf("[WARN] Failed to update DNS record: %v", err)
 		}
 	}
@@ -676,19 +679,19 @@ func (b *VMClusterBridge) resizeInstance(
 	})
 }
 
-// getSubnetVPC resolves the VPC ID from the configured subnet.
-func (b *VMClusterBridge) getSubnetVPC(ctx context.Context, ec2c *ec2.Client) (string, error) {
-	if b.subnetID == "" {
-		return "", fmt.Errorf("SUBNET_ID not configured")
+// getSubnetVPC resolves the VPC ID from the given subnet.
+func (b *VMClusterBridge) getSubnetVPC(ctx context.Context, ec2c *ec2.Client, subnetID string) (string, error) {
+	if subnetID == "" {
+		return "", fmt.Errorf("target option 'SubnetID' is required")
 	}
 	result, err := ec2c.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
-		SubnetIds: []string{b.subnetID},
+		SubnetIds: []string{subnetID},
 	})
 	if err != nil {
 		return "", err
 	}
 	if len(result.Subnets) == 0 {
-		return "", fmt.Errorf("subnet %s not found", b.subnetID)
+		return "", fmt.Errorf("subnet %s not found", subnetID)
 	}
 	return aws.ToString(result.Subnets[0].VpcId), nil
 }
@@ -849,8 +852,8 @@ func (b *VMClusterBridge) pollInstanceReady(bctx api.BridgeContext, payload api.
 }
 
 // upsertDNSRecord creates or updates A records for the cluster domain and wildcard.
-func (b *VMClusterBridge) upsertDNSRecord(ctx context.Context, domain, ip string) error {
-	r53c, err := b.route53Client(ctx)
+func (b *VMClusterBridge) upsertDNSRecord(ctx context.Context, roleARN, hostedZoneID, domain, ip string) error {
+	r53c, err := b.route53Client(ctx, roleARN)
 	if err != nil {
 		return err
 	}
@@ -882,7 +885,7 @@ func (b *VMClusterBridge) upsertDNSRecord(ctx context.Context, domain, ip string
 	}
 
 	_, err = r53c.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(b.hostedZoneID),
+		HostedZoneId: aws.String(hostedZoneID),
 		ChangeBatch: &r53types.ChangeBatch{
 			Changes: changes,
 			Comment: aws.String(fmt.Sprintf("VMCluster %s", domain)),

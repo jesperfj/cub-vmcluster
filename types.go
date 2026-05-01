@@ -20,13 +20,30 @@ type VMClusterMeta struct {
 
 type VMClusterSpec struct {
 	InstanceType           string      `yaml:"instanceType"`
-	Region                 string      `yaml:"region"`
 	DiskSizeGB             int         `yaml:"diskSizeGB"`
 	K3sVersion             string      `yaml:"k3sVersion"`
 	Ingress                IngressSpec `yaml:"ingress"`
 	Worker                 WorkerSpec  `yaml:"worker"`
 	InstallVMClusterWorker bool        `yaml:"installVMClusterWorker,omitempty"`
 	VMClusterWorkerImage   string      `yaml:"vmclusterWorkerImage,omitempty"`
+}
+
+// BridgeTargetOptions holds the per-target configuration the controller pulls
+// out of payload.TargetOptions on each Apply/Refresh/Destroy.
+type BridgeTargetOptions struct {
+	SubnetID     string
+	HostedZoneID string
+	Region       string
+	RoleARN      string
+}
+
+func parseTargetOptions(opts map[string]string) BridgeTargetOptions {
+	return BridgeTargetOptions{
+		SubnetID:     opts["SubnetID"],
+		HostedZoneID: opts["HostedZoneID"],
+		Region:       opts["Region"],
+		RoleARN:      opts["RoleARN"],
+	}
 }
 
 type IngressSpec struct {

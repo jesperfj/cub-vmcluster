@@ -48,7 +48,8 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 		}
 	}
 
-	region := cluster.Spec.Region
+	topts := parseTargetOptions(payload.TargetOptions)
+	region := topts.Region
 	if region == "" {
 		region = "us-east-1"
 	}
@@ -70,7 +71,7 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 			},
 		})
 
-		if err := b.deleteWorkerDeployment(awsCtx, existing.InstanceID, region); err != nil {
+		if err := b.deleteWorkerDeployment(awsCtx, topts.RoleARN, existing.InstanceID, region); err != nil {
 			log.Printf("[WARN] Failed to delete worker deployment: %v", err)
 		} else {
 			// Give ConfigHub a moment to register the disconnect
@@ -80,7 +81,7 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 
 	// Step 2: Terminate instance
 	if existing.InstanceID != "" {
-		ec2c, err := b.ec2Client(awsCtx, region)
+		ec2c, err := b.ec2Client(awsCtx, topts.RoleARN, region)
 		if err != nil {
 			return b.sendDestroyFailed(ctx, payload, startTime, fmt.Sprintf("failed to create EC2 client: %v", err))
 		}
@@ -114,15 +115,15 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 	}
 
 	// Step 4: Remove DNS records
-	if existing.DNSRecord != "" && existing.PublicIP != "" && b.hostedZoneID != "" {
+	if existing.DNSRecord != "" && existing.PublicIP != "" && topts.HostedZoneID != "" {
 		log.Printf("[INFO] Removing DNS records for %s", existing.DNSRecord)
-		if err := b.deleteDNSRecord(awsCtx, existing.DNSRecord, existing.PublicIP); err != nil {
+		if err := b.deleteDNSRecord(awsCtx, topts.RoleARN, topts.HostedZoneID, existing.DNSRecord, existing.PublicIP); err != nil {
 			log.Printf("[WARN] Failed to delete DNS record: %v", err)
 		}
 	}
 
 	// Step 5: Tear down per-VM IAM role/profile (no-op for legacy VMs that never had one)
-	if err := b.deletePerVMInstanceProfile(awsCtx, payload.UnitID.String()); err != nil {
+	if err := b.deletePerVMInstanceProfile(awsCtx, topts.RoleARN, payload.UnitID.String()); err != nil {
 		log.Printf("[WARN] Failed to delete per-VM IAM resources: %v", err)
 	}
 
@@ -146,8 +147,8 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 
 // deleteWorkerDeployment deletes the cub-worker deployment via SSM so it disconnects
 // cleanly from ConfigHub before the instance is terminated.
-func (b *VMClusterBridge) deleteWorkerDeployment(ctx context.Context, instanceID, region string) error {
-	cfg, err := b.assumeRoleConfig(ctx)
+func (b *VMClusterBridge) deleteWorkerDeployment(ctx context.Context, roleARN, instanceID, region string) error {
+	cfg, err := b.assumeRoleConfig(ctx, roleARN)
 	if err != nil {
 		return err
 	}
@@ -185,8 +186,8 @@ func (b *VMClusterBridge) deleteWorkerDeployment(ctx context.Context, instanceID
 }
 
 // deleteDNSRecord removes A records for the domain and wildcard.
-func (b *VMClusterBridge) deleteDNSRecord(ctx context.Context, domain, ip string) error {
-	r53c, err := b.route53Client(ctx)
+func (b *VMClusterBridge) deleteDNSRecord(ctx context.Context, roleARN, hostedZoneID, domain, ip string) error {
+	r53c, err := b.route53Client(ctx, roleARN)
 	if err != nil {
 		return err
 	}
@@ -217,7 +218,7 @@ func (b *VMClusterBridge) deleteDNSRecord(ctx context.Context, domain, ip string
 	}
 
 	_, err = r53c.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(b.hostedZoneID),
+		HostedZoneId: aws.String(hostedZoneID),
 		ChangeBatch: &r53types.ChangeBatch{
 			Changes: changes,
 			Comment: aws.String(fmt.Sprintf("Destroy VMCluster %s", domain)),

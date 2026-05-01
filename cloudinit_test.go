@@ -14,7 +14,6 @@ func TestRenderUserDataIngressEnabled(t *testing.T) {
 		},
 		Spec: VMClusterSpec{
 			InstanceType: "t3.medium",
-			Region:       "us-east-1",
 			DiskSizeGB:   30,
 			K3sVersion:   "v1.35.2+k3s1",
 			Ingress: IngressSpec{
@@ -37,7 +36,7 @@ func TestRenderUserDataIngressEnabled(t *testing.T) {
 		WorkerSecret: "ch_testsecret",
 	})
 
-	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{})
+	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{}, BridgeTargetOptions{Region: "us-east-1"})
 	if err != nil {
 		t.Fatalf("renderUserData failed: %v", err)
 	}
@@ -100,7 +99,7 @@ func TestRenderUserDataNoIngress(t *testing.T) {
 		WorkerSecret: "ch_secret",
 	})
 
-	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{})
+	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{}, BridgeTargetOptions{Region: "us-east-1"})
 	if err != nil {
 		t.Fatalf("renderUserData failed: %v", err)
 	}

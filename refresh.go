@@ -63,12 +63,13 @@ func (b *VMClusterBridge) Refresh(ctx api.BridgeContext, payload api.BridgePaylo
 		})
 	}
 
-	region := cluster.Spec.Region
+	topts := parseTargetOptions(payload.TargetOptions)
+	region := topts.Region
 	if region == "" {
 		region = "us-east-1"
 	}
 
-	ec2c, err := b.ec2Client(ctx.Context(), region)
+	ec2c, err := b.ec2Client(ctx.Context(), topts.RoleARN, region)
 	if err != nil {
 		return b.sendRefreshFailed(ctx, payload, startTime, fmt.Sprintf("failed to create EC2 client: %v", err))
 	}

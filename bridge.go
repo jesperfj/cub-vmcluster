@@ -20,10 +20,7 @@ const ProviderVMCluster = api.ProviderType("VMCluster")
 // VMClusterBridge implements the ConfigHub BridgeWorker interface for provisioning
 // single-node k3s clusters on EC2.
 type VMClusterBridge struct {
-	awsCfg       aws.Config
-	roleARN      string
-	hostedZoneID string
-	subnetID     string
+	awsCfg aws.Config
 
 	// ConfigHub API credentials (this worker's own credentials, used to manage child workers)
 	confighubURL    string
@@ -32,12 +29,6 @@ type VMClusterBridge struct {
 }
 
 type VMClusterBridgeConfig struct {
-	// RoleARN is the IAM role to assume in the demo account.
-	RoleARN string
-	// HostedZoneID is the Route53 hosted zone for DNS records.
-	HostedZoneID string
-	// SubnetID is the VPC subnet to launch instances in.
-	SubnetID string
 	// ConfigHub API credentials for managing child workers.
 	ConfigHubURL    string
 	ConfigHubID     string
@@ -52,9 +43,6 @@ func NewVMClusterBridge(cfg VMClusterBridgeConfig) (*VMClusterBridge, error) {
 
 	return &VMClusterBridge{
 		awsCfg:          awsCfg,
-		roleARN:         cfg.RoleARN,
-		hostedZoneID:    cfg.HostedZoneID,
-		subnetID:        cfg.SubnetID,
 		confighubURL:    cfg.ConfigHubURL,
 		confighubID:     cfg.ConfigHubID,
 		confighubSecret: cfg.ConfigHubSecret,
@@ -62,20 +50,20 @@ func NewVMClusterBridge(cfg VMClusterBridgeConfig) (*VMClusterBridge, error) {
 }
 
 // assumeRoleConfig returns an AWS config with the cross-account role assumed.
-func (b *VMClusterBridge) assumeRoleConfig(ctx context.Context) (aws.Config, error) {
-	if b.roleARN == "" {
-		// No cross-account role; use default credentials (for local dev).
+// roleARN may be empty for local dev (uses default credentials).
+func (b *VMClusterBridge) assumeRoleConfig(ctx context.Context, roleARN string) (aws.Config, error) {
+	if roleARN == "" {
 		return b.awsCfg, nil
 	}
 	stsClient := sts.NewFromConfig(b.awsCfg)
-	creds := stscreds.NewAssumeRoleProvider(stsClient, b.roleARN)
+	creds := stscreds.NewAssumeRoleProvider(stsClient, roleARN)
 	cfg := b.awsCfg.Copy()
 	cfg.Credentials = aws.NewCredentialsCache(creds)
 	return cfg, nil
 }
 
-func (b *VMClusterBridge) ec2Client(ctx context.Context, region string) (*ec2.Client, error) {
-	cfg, err := b.assumeRoleConfig(ctx)
+func (b *VMClusterBridge) ec2Client(ctx context.Context, roleARN, region string) (*ec2.Client, error) {
+	cfg, err := b.assumeRoleConfig(ctx, roleARN)
 	if err != nil {
 		return nil, err
 	}
@@ -86,8 +74,8 @@ func (b *VMClusterBridge) ec2Client(ctx context.Context, region string) (*ec2.Cl
 	}), nil
 }
 
-func (b *VMClusterBridge) route53Client(ctx context.Context) (*route53.Client, error) {
-	cfg, err := b.assumeRoleConfig(ctx)
+func (b *VMClusterBridge) route53Client(ctx context.Context, roleARN string) (*route53.Client, error) {
+	cfg, err := b.assumeRoleConfig(ctx, roleARN)
 	if err != nil {
 		return nil, err
 	}

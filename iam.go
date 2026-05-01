@@ -24,8 +24,8 @@ func perVMRoleName(unitID string) string {
 	return perVMRolePrefix + unitID
 }
 
-func (b *VMClusterBridge) iamClient(ctx context.Context) (*iam.Client, error) {
-	cfg, err := b.assumeRoleConfig(ctx)
+func (b *VMClusterBridge) iamClient(ctx context.Context, roleARN string) (*iam.Client, error) {
+	cfg, err := b.assumeRoleConfig(ctx, roleARN)
 	if err != nil {
 		return nil, err
 	}
@@ -34,9 +34,9 @@ func (b *VMClusterBridge) iamClient(ctx context.Context) (*iam.Client, error) {
 
 // ensurePerVMInstanceProfile creates (or recovers) an IAM role + instance profile
 // scoped to a single VM. Returns the instance profile name.
-func (b *VMClusterBridge) ensurePerVMInstanceProfile(ctx context.Context, unitID, region string, includeVMClusterOps bool) (string, error) {
+func (b *VMClusterBridge) ensurePerVMInstanceProfile(ctx context.Context, roleARN, unitID, region string, includeVMClusterOps bool) (string, error) {
 	name := perVMRoleName(unitID)
-	iamc, err := b.iamClient(ctx)
+	iamc, err := b.iamClient(ctx, roleARN)
 	if err != nil {
 		return "", err
 	}
@@ -63,7 +63,7 @@ func (b *VMClusterBridge) ensurePerVMInstanceProfile(ctx context.Context, unitID
 	}
 
 	if includeVMClusterOps {
-		account, err := b.callerAccountID(ctx)
+		account, err := b.callerAccountID(ctx, roleARN)
 		if err != nil {
 			return "", fmt.Errorf("resolve account ID: %w", err)
 		}
@@ -97,9 +97,9 @@ func (b *VMClusterBridge) ensurePerVMInstanceProfile(ctx context.Context, unitID
 
 // deletePerVMInstanceProfile tears down the role + instance profile for a unit.
 // Safe to call when the resources don't exist (e.g. legacy VMs).
-func (b *VMClusterBridge) deletePerVMInstanceProfile(ctx context.Context, unitID string) error {
+func (b *VMClusterBridge) deletePerVMInstanceProfile(ctx context.Context, roleARN, unitID string) error {
 	name := perVMRoleName(unitID)
-	iamc, err := b.iamClient(ctx)
+	iamc, err := b.iamClient(ctx, roleARN)
 	if err != nil {
 		return err
 	}
@@ -182,8 +182,8 @@ func (b *VMClusterBridge) ensureInstanceProfile(ctx context.Context, iamc *iam.C
 	return nil
 }
 
-func (b *VMClusterBridge) callerAccountID(ctx context.Context) (string, error) {
-	cfg, err := b.assumeRoleConfig(ctx)
+func (b *VMClusterBridge) callerAccountID(ctx context.Context, roleARN string) (string, error) {
+	cfg, err := b.assumeRoleConfig(ctx, roleARN)
 	if err != nil {
 		return "", err
 	}

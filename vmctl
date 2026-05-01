@@ -393,10 +393,14 @@ cmd_init() {
     fi
     log_success "Worker: $WORKER_SLUG ($WORKER_ID)"
 
-    # --- Create target for the vmcluster-controller worker ---
+    # --- Create target for the vmcluster-controller worker, with the per-target options ---
     CONTROLLER_TARGET="${WORKER_SLUG}"
     log_info "Creating target '$CONTROLLER_TARGET' for worker '$WORKER_SLUG'..."
-    cub target create "$CONTROLLER_TARGET" "{}" "$WORKER_SLUG" --space "$WORKER_SPACE" --allow-exists --provider VMCluster 2>&1 || {
+    cub target create "$CONTROLLER_TARGET" "{}" "$WORKER_SLUG" \
+        --space "$WORKER_SPACE" \
+        --provider VMCluster \
+        --option "SubnetID=${SUBNET_ID};HostedZoneID=${ZONE_ID};Region=${AWS_REGION}" \
+        --allow-exists 2>&1 || {
         die "Failed to create target"
     }
     log_success "Target: $CONTROLLER_TARGET"
@@ -410,8 +414,6 @@ CONFIGHUB_WORKER_ID=$WORKER_ID
 CONFIGHUB_WORKER_SECRET=$WORKER_SECRET
 WORKER_SPACE=$WORKER_SPACE
 WORKER_SLUG=$WORKER_SLUG
-SUBNET_ID=$SUBNET_ID
-ROUTE53_HOSTED_ZONE_ID=$ZONE_ID
 AWS_REGION=$AWS_REGION
 EOF
 
@@ -461,7 +463,6 @@ metadata:
   name: ${CLUSTER_NAME}
 spec:
   instanceType: ${CLUSTER_INSTANCE_TYPE}
-  region: ${AWS_REGION}
   diskSizeGB: 30
   k3sVersion: ${CLUSTER_K3S_VERSION}
   ingress:
@@ -1137,6 +1138,86 @@ cmd_reassign() {
     log_success "Cluster '$cluster_name' reassigned to ${tenant_space}/${tenant_worker} (org $tenant_org_id)"
 }
 
+cmd_add_target() {
+    require_env
+    local target_slug="${1:?Usage: vmctl add-target <slug> --region <region> [--subnet <id>] [--zone <id>]}"
+    shift
+    local target_region="" target_subnet="" target_zone=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --region) target_region="$2"; shift 2;;
+            --subnet) target_subnet="$2"; shift 2;;
+            --zone)   target_zone="$2"; shift 2;;
+            *) die "Unknown flag: $1";;
+        esac
+    done
+    [[ -n "$target_region" ]] || die "--region is required"
+    [[ -n "$WORKER_SPACE" && -n "$WORKER_SLUG" ]] || die "WORKER_SPACE/WORKER_SLUG missing from .env (re-run vmctl init)"
+
+    echo ""
+    log_info "Adding target '$target_slug' (region $target_region) bound to worker '$WORKER_SLUG'"
+
+    if [[ -z "$target_subnet" ]]; then
+        log_info "Discovering VPCs in $target_region..."
+        local vpc_list
+        vpc_list=$(aws ec2 describe-vpcs --region "$target_region" \
+            --query "Vpcs[].[VpcId,CidrBlock,Tags[?Key=='Name']|[0].Value || 'unnamed']" \
+            --output text | while read -r id cidr name; do echo "$id ($name, $cidr)"; done)
+        [[ -n "$vpc_list" ]] || die "No VPCs found in $target_region"
+        lines_to_array VPC_OPTIONS "$vpc_list"
+        pick_from_list VPC_CHOICE "Select a VPC:" "${VPC_OPTIONS[@]}"
+        local vpc_id
+        vpc_id=$(echo "$VPC_CHOICE" | cut -d' ' -f1)
+
+        log_info "Discovering subnets in $vpc_id..."
+        local subnet_list
+        subnet_list=$(aws ec2 describe-subnets --region "$target_region" \
+            --filters "Name=vpc-id,Values=$vpc_id" \
+            --query "Subnets[].[SubnetId,AvailabilityZone,CidrBlock,MapPublicIpOnLaunch,Tags[?Key=='Name']|[0].Value || 'unnamed']" \
+            --output text | while read -r id az cidr public name; do
+                label="$id ($name, $az, $cidr"
+                if [[ "$public" == "True" ]]; then label="$label, public"; fi
+                echo "$label)"
+            done)
+        [[ -n "$subnet_list" ]] || die "No subnets found in VPC $vpc_id"
+        lines_to_array SUBNET_OPTIONS "$subnet_list"
+        pick_from_list SUBNET_CHOICE "Select a subnet (public recommended):" "${SUBNET_OPTIONS[@]}"
+        target_subnet=$(echo "$SUBNET_CHOICE" | cut -d' ' -f1)
+    fi
+    log_success "Subnet: $target_subnet"
+
+    if [[ -z "$target_zone" ]]; then
+        log_info "Discovering Route53 hosted zones..."
+        local zone_list
+        zone_list=$(aws route53 list-hosted-zones \
+            --query "HostedZones[?Config.PrivateZone==\`false\`].[Id,Name]" \
+            --output text | while read -r id name; do
+                id="${id#/hostedzone/}"
+                echo "$id ($name)"
+            done)
+        if [[ -n "$zone_list" ]]; then
+            lines_to_array ZONE_OPTIONS "$zone_list"
+            ZONE_OPTIONS[${#ZONE_OPTIONS[@]}]="Skip — no DNS"
+            pick_from_list ZONE_CHOICE "Select a Route53 hosted zone for DNS:" "${ZONE_OPTIONS[@]}"
+            if [[ "$ZONE_CHOICE" != "Skip — no DNS" ]]; then
+                target_zone=$(echo "$ZONE_CHOICE" | cut -d' ' -f1)
+            fi
+        fi
+    fi
+    [[ -n "$target_zone" ]] && log_success "Route53 zone: $target_zone" || log_info "No DNS zone configured"
+
+    log_info "Creating target '$target_slug' in space '$WORKER_SPACE'..."
+    cub target create "$target_slug" "{}" "$WORKER_SLUG" \
+        --space "$WORKER_SPACE" \
+        --provider VMCluster \
+        --option "SubnetID=${target_subnet};HostedZoneID=${target_zone};Region=${target_region}" \
+        --allow-exists 2>&1 || die "Failed to create target"
+    log_success "Target '$target_slug' ready"
+    echo ""
+    echo "  Bind a VMCluster unit to it with:  cub unit set-target <unit> $target_slug --space <unit-space>"
+    echo ""
+}
+
 cmd_list() {
     require_env
     aws ec2 describe-instances --region "$REGION" \
@@ -1183,6 +1264,8 @@ usage() {
     echo ""
     echo "Setup:"
     echo "  init [--skip-infra]        Set up AWS infra, ConfigHub worker, and first cluster"
+    echo "  add-target <slug> --region <r> [--subnet <id>] [--zone <id>]"
+    echo "                             Add another VMCluster target (e.g. for a different region)"
     echo "  teardown [--force]         Remove all AWS infrastructure"
     echo "  status                     Show infrastructure and running clusters"
     echo ""
@@ -1198,6 +1281,7 @@ usage() {
 
 case "${1:-}" in
     init)       shift; cmd_init "$@" ;;
+    add-target) shift; cmd_add_target "$@" ;;
     teardown)   shift; cmd_teardown "$@" ;;
     status)     cmd_status ;;
     list)       cmd_list ;;
