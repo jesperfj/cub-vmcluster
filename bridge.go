@@ -110,11 +110,6 @@ func (b *VMClusterBridge) Info(opts api.InfoOptions) api.BridgeInfo {
 						{Name: "RoleARN", DataType: "string", Description: "Optional cross-account IAM role ARN to assume"},
 					},
 				},
-				AvailableTargets: []api.Target{
-					{
-						Name: api.GenerateTargetName(opts.WorkerSlug, ProviderVMCluster, workerapi.ToolchainKubernetesYAML, "default"),
-					},
-				},
 			},
 		},
 	}
