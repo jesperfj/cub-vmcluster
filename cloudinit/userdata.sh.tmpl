@@ -57,6 +57,27 @@ cat > /var/lib/rancher/k3s/server/manifests/confighub-worker.yaml <<'MANIFEST'
 {{.WorkerManifest}}
 MANIFEST
 
+# --- Fetch worker credentials from SSM Parameter Store and create the k8s Secret ---
+# The Secret is intentionally NOT part of the worker manifest above so credentials
+# never live in ConfigHub. SSM is the source of truth; the per-VM IAM role grants
+# read access only to /cub-vmcluster/<this-unit-id>/*.
+WORKER_ID=$(aws ssm get-parameter --region "$REGION" \
+  --name "/cub-vmcluster/{{.UnitID}}/cub-worker-id" \
+  --query Parameter.Value --output text)
+WORKER_SECRET=$(aws ssm get-parameter --region "$REGION" --with-decryption \
+  --name "/cub-vmcluster/{{.UnitID}}/cub-worker-secret" \
+  --query Parameter.Value --output text)
+
+# Wait for the namespace (created by the manifest above) before creating the Secret in it.
+until kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get namespace confighub-system &>/dev/null; do
+  sleep 2
+done
+
+kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml -n confighub-system create secret generic cub-worker-secret \
+  --from-literal=CONFIGHUB_WORKER_ID="$WORKER_ID" \
+  --from-literal=CONFIGHUB_WORKER_SECRET="$WORKER_SECRET" \
+  --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -
+
 {{if .InstallVMClusterWorker}}
 # --- Deploy cub-vmcluster worker (self-install for bootstrap pivot) ---
 cat > /var/lib/rancher/k3s/server/manifests/cub-vmcluster.yaml <<'VMCMANIFEST'

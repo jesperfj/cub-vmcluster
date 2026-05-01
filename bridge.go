@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/confighub/sdk/core/worker/api"
 	"github.com/confighub/sdk/core/workerapi"
@@ -68,6 +69,18 @@ func (b *VMClusterBridge) ec2Client(ctx context.Context, roleARN, region string)
 		return nil, err
 	}
 	return ec2.NewFromConfig(cfg, func(o *ec2.Options) {
+		if region != "" {
+			o.Region = region
+		}
+	}), nil
+}
+
+func (b *VMClusterBridge) ssmClient(ctx context.Context, roleARN, region string) (*ssm.Client, error) {
+	cfg, err := b.assumeRoleConfig(ctx, roleARN)
+	if err != nil {
+		return nil, err
+	}
+	return ssm.NewFromConfig(cfg, func(o *ssm.Options) {
 		if region != "" {
 			o.Region = region
 		}

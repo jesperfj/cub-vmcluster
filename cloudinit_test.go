@@ -32,11 +32,9 @@ func TestRenderUserDataIngressEnabled(t *testing.T) {
 
 	manifest := generateWorkerManifest(WorkerManifestParams{
 		ConfigHubURL: "https://app.confighub.com",
-		WorkerID:     "wkr_test",
-		WorkerSecret: "ch_testsecret",
 	})
 
-	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{}, BridgeTargetOptions{Region: "us-east-1"})
+	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{}, BridgeTargetOptions{Region: "us-east-1"}, "test-unit-id")
 	if err != nil {
 		t.Fatalf("renderUserData failed: %v", err)
 	}
@@ -52,8 +50,7 @@ func TestRenderUserDataIngressEnabled(t *testing.T) {
 		{"disable servicelb", "--disable servicelb"},
 		{"worker image", "ghcr.io/confighubai/confighub-worker:latest"},
 		{"confighub url", "https://app.confighub.com"},
-		{"worker id", "wkr_test"},
-		{"worker secret", "ch_testsecret"},
+		{"unit id available to cloud-init", "test-unit-id"},
 		{"cert-manager", "cert-manager.yaml"},
 		{"letsencrypt email", "ops@example.com"},
 		{"ready tag", `tag_status "ready"`},
@@ -95,11 +92,9 @@ func TestRenderUserDataNoIngress(t *testing.T) {
 
 	manifest := generateWorkerManifest(WorkerManifestParams{
 		ConfigHubURL: "https://app.confighub.com",
-		WorkerID:     "wkr_noing",
-		WorkerSecret: "ch_secret",
 	})
 
-	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{}, BridgeTargetOptions{Region: "us-east-1"})
+	userData, err := renderUserData(cluster, manifest, &VMClusterBridge{}, BridgeTargetOptions{Region: "us-east-1"}, "no-ingress-unit-id")
 	if err != nil {
 		t.Fatalf("renderUserData failed: %v", err)
 	}
@@ -134,8 +129,6 @@ func TestRenderUserDataNoIngress(t *testing.T) {
 func TestGenerateWorkerManifest(t *testing.T) {
 	manifest := generateWorkerManifest(WorkerManifestParams{
 		ConfigHubURL: "https://hub.confighub.com",
-		WorkerID:     "wkr_abc123",
-		WorkerSecret: "ch_secret456",
 	})
 
 	mustContain := []struct {
@@ -145,12 +138,9 @@ func TestGenerateWorkerManifest(t *testing.T) {
 		{"namespace", "kind: Namespace"},
 		{"service account", "kind: ServiceAccount"},
 		{"cluster role binding", "kind: ClusterRoleBinding"},
-		{"secret", "kind: Secret"},
 		{"deployment", "kind: Deployment"},
 		{"default image", "ghcr.io/confighubai/confighub-worker:latest"},
 		{"confighub url", "https://hub.confighub.com"},
-		{"worker id in secret", "wkr_abc123"},
-		{"worker secret in secret", "ch_secret456"},
 		{"envFrom secretRef", "secretRef"},
 	}
 	for _, c := range mustContain {
@@ -158,13 +148,15 @@ func TestGenerateWorkerManifest(t *testing.T) {
 			t.Errorf("%s: expected %q in manifest, not found", c.name, c.want)
 		}
 	}
+	// Secret is created by cloud-init from SSM, not embedded in this manifest.
+	if strings.Contains(manifest, "kind: Secret") {
+		t.Error("worker manifest must not contain the Secret resource (it's created by cloud-init from SSM)")
+	}
 }
 
 func TestGenerateWorkerManifestCustomImage(t *testing.T) {
 	manifest := generateWorkerManifest(WorkerManifestParams{
 		ConfigHubURL: "https://hub.confighub.com",
-		WorkerID:     "wkr_test",
-		WorkerSecret: "ch_test",
 		WorkerImage:  "my-registry.com/worker:v2",
 	})
 

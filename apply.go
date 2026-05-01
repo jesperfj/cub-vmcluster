@@ -101,7 +101,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 						cluster.Metadata.Name, cluster.Spec.Worker.TenantOrganizationID)
 					liveStateJSON, _ = json.Marshal(existing)
 				} else {
-					setup, err := b.setupConfigHubResources(ctx.Context(), ctx, payload, startTime, &cluster, &existing)
+					setup, err := b.setupConfigHubResources(ctx.Context(), ctx, payload, startTime, &cluster, &existing, topts)
 					if err != nil {
 						return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
 					}
@@ -158,7 +158,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	// RunInstances and the LiveState write.
 	if id := b.findExistingInstance(awsCtx, ec2c, payload.UnitID.String()); id != "" {
 		log.Printf("[INFO] Recovering orphaned instance %s for unit %s (cluster %s)", id, payload.UnitID.String(), cluster.Metadata.Name)
-		setup, err := b.setupConfigHubResources(awsCtx, ctx, payload, startTime, &cluster, &existing)
+		setup, err := b.setupConfigHubResources(awsCtx, ctx, payload, startTime, &cluster, &existing, topts)
 		if err != nil {
 			return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
 		}
@@ -192,13 +192,13 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	log.Printf("[INFO] Security group: %s", sgID)
 
 	// Step 2: Setup ConfigHub resources (worker, target, config unit)
-	setup, err := b.setupConfigHubResources(awsCtx, ctx, payload, startTime, &cluster, &existing)
+	setup, err := b.setupConfigHubResources(awsCtx, ctx, payload, startTime, &cluster, &existing, topts)
 	if err != nil {
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
 	}
 
 	// Step 3: Render cloud-init
-	userData, err := renderUserData(&cluster, setup.Manifest, b, topts)
+	userData, err := renderUserData(&cluster, setup.Manifest, b, topts, payload.UnitID.String())
 	if err != nil {
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to render cloud-init: %v", err))
 	}
@@ -412,7 +412,7 @@ func (b *VMClusterBridge) completeLaunch(
 		LaunchTime:      inst.LaunchTime.Format(time.RFC3339),
 		SecurityGroupID: sgID,
 		WorkerID:        setup.WorkerID,
-		WorkerSecret:    setup.WorkerSecret,
+		// WorkerSecret intentionally omitted — credentials live in SSM, not ConfigHub.
 		WorkerConnected: ready,
 		K3sReady:        ready,
 		DNSRecord:       cluster.Spec.Ingress.Domain,
@@ -446,6 +446,8 @@ func (b *VMClusterBridge) completeLaunch(
 }
 
 // setupConfigHubResources creates or resolves the worker, target, and config unit.
+// Writes the worker credentials to SSM so cloud-init on the VM can fetch them
+// at boot — keeps the secret out of ConfigHub.
 func (b *VMClusterBridge) setupConfigHubResources(
 	ctx context.Context,
 	bctx api.BridgeContext,
@@ -453,6 +455,7 @@ func (b *VMClusterBridge) setupConfigHubResources(
 	startTime time.Time,
 	cluster *VMCluster,
 	existing *LiveState,
+	topts BridgeTargetOptions,
 ) (*ConfigHubSetupResult, error) {
 	// Parse worker.name -> space, workerSlug
 	spaceSlug, workerSlug, err := parseSlashNotation(cluster.Spec.Worker.Name)
@@ -501,14 +504,20 @@ func (b *VMClusterBridge) setupConfigHubResources(
 	workerSecret := creds.Secret
 	if created {
 		log.Printf("[INFO] Created worker %s (ID: %s)", workerSlug, creds.WorkerID)
+		// Write fresh creds to SSM as the source of truth for cloud-init.
+		if err := b.writeWorkerCredsToSSM(ctx, topts.RoleARN, topts.Region, payload.UnitID.String(), creds.WorkerID, workerSecret); err != nil {
+			return nil, fmt.Errorf("failed to write worker creds to SSM: %w", err)
+		}
 	} else {
 		log.Printf("[INFO] Worker %s already exists (ID: %s)", workerSlug, creds.WorkerID)
-		// Recover secret from LiveState if the worker already existed
+		// Worker already exists; the secret is in SSM from a prior run. Fall back to
+		// LiveState if migrating from an older controller that stored it there.
 		if workerSecret == "" && existing.WorkerSecret != "" {
 			workerSecret = existing.WorkerSecret
-		}
-		if workerSecret == "" {
-			return nil, fmt.Errorf("worker %s already exists but secret is not available; delete and recreate the worker", workerSlug)
+			// Backfill SSM so future readers don't need the LiveState fallback.
+			if err := b.writeWorkerCredsToSSM(ctx, topts.RoleARN, topts.Region, payload.UnitID.String(), creds.WorkerID, workerSecret); err != nil {
+				log.Printf("[WARN] failed to backfill SSM with worker creds: %v", err)
+			}
 		}
 	}
 
@@ -524,11 +533,10 @@ func (b *VMClusterBridge) setupConfigHubResources(
 	}
 	log.Printf("[INFO] Target %s (ID: %s)", targetSlug, target.TargetID.String())
 
-	// Step 3: Generate worker manifest
+	// Step 3: Generate worker manifest. Worker creds are NOT embedded — cloud-init
+	// fetches them from SSM and creates the k8s Secret separately.
 	manifest := generateWorkerManifest(WorkerManifestParams{
 		ConfigHubURL: b.confighubURL,
-		WorkerID:     creds.WorkerID,
-		WorkerSecret: workerSecret,
 	})
 
 	// Step 4: Ensure config unit exists

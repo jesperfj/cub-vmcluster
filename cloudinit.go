@@ -11,6 +11,7 @@ import (
 var cloudinitFS embed.FS
 
 type CloudInitParams struct {
+	UnitID         string // ConfigHub Unit UUID, used to find SSM-stored worker creds
 	ClusterName    string
 	K3sVersion     string
 	ConfigHubURL   string
@@ -33,13 +34,12 @@ type CloudInitParams struct {
 type WorkerManifestParams struct {
 	WorkerImage  string
 	ConfigHubURL string
-	WorkerID     string
-	WorkerSecret string
 }
 
 // generateWorkerManifest produces the Kubernetes YAML manifest for deploying cub-worker
-// into a k3s cluster. This is the same manifest used both for cloud-init bootstrap and
-// as the initial content of the worker config unit.
+// into a k3s cluster. The cub-worker-secret Secret is *not* part of this manifest;
+// cloud-init creates it from SSM Parameter Store at boot so credentials never live
+// in ConfigHub.
 func generateWorkerManifest(p WorkerManifestParams) string {
 	if p.WorkerImage == "" {
 		p.WorkerImage = "ghcr.io/confighubai/confighub-worker:latest"
@@ -68,16 +68,6 @@ subjects:
 - kind: ServiceAccount
   name: cub-worker
   namespace: confighub-system
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cub-worker-secret
-  namespace: confighub-system
-type: Opaque
-stringData:
-  CONFIGHUB_WORKER_ID: "%s"
-  CONFIGHUB_WORKER_SECRET: "%s"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -115,10 +105,10 @@ spec:
           mountPath: /tmp
       volumes:
       - name: tmp
-        emptyDir: {}`, p.WorkerID, p.WorkerSecret, p.WorkerImage, p.ConfigHubURL)
+        emptyDir: {}`, p.WorkerImage, p.ConfigHubURL)
 }
 
-func renderUserData(cluster *VMCluster, workerManifest string, bridge *VMClusterBridge, topts BridgeTargetOptions) (string, error) {
+func renderUserData(cluster *VMCluster, workerManifest string, bridge *VMClusterBridge, topts BridgeTargetOptions, unitID string) (string, error) {
 	tmplData, err := cloudinitFS.ReadFile("cloudinit/userdata.sh.tmpl")
 	if err != nil {
 		return "", fmt.Errorf("failed to read userdata template: %w", err)
@@ -135,6 +125,7 @@ func renderUserData(cluster *VMCluster, workerManifest string, bridge *VMCluster
 	}
 
 	params := CloudInitParams{
+		UnitID:         unitID,
 		ClusterName:    cluster.Metadata.Name,
 		K3sVersion:     cluster.Spec.K3sVersion,
 		ConfigHubURL:   bridge.confighubURL,

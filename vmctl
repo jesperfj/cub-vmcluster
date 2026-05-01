@@ -144,9 +144,10 @@ ssm_exec() {
 }
 
 # Mirror of cloudinit.go:generateWorkerManifest. Keep the two in sync until vmctl moves to Go.
+# Worker credentials are NOT embedded — the Secret is created separately via kubectl.
 generate_worker_manifest() {
-    local url="$1" worker_id="$2" worker_secret="$3"
-    local image="${4:-ghcr.io/confighubai/confighub-worker:latest}"
+    local url="$1"
+    local image="${2:-ghcr.io/confighubai/confighub-worker:latest}"
     cat <<EOF
 apiVersion: v1
 kind: Namespace
@@ -171,16 +172,6 @@ subjects:
 - kind: ServiceAccount
   name: cub-worker
   namespace: confighub-system
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cub-worker-secret
-  namespace: confighub-system
-type: Opaque
-stringData:
-  CONFIGHUB_WORKER_ID: "${worker_id}"
-  CONFIGHUB_WORKER_SECRET: "${worker_secret}"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1062,21 +1053,32 @@ cmd_reassign() {
     resolve_instance "$cluster_name"
     log_info "Instance: $INSTANCE_ID"
 
+    # Capture the user's currently-active cub context so the tenant auth-login
+    # below doesn't strand control-plane commands in the wrong context.
+    local cp_ctx
+    cp_ctx=$(cub context get -o jq=.name)
+    [[ -n "$cp_ctx" && "$cp_ctx" != "null" ]] || die "Could not determine current cub context"
+
     # Locate the VMCluster unit (across all spaces the user can read)
     local cp_space="$WORKER_SPACE"
     if [[ -z "$cp_space" ]]; then
-        cp_space=$(cub unit list --space "*" --where "Slug='$cluster_name'" -o json 2>/dev/null \
+        cp_space=$(cub --context "$cp_ctx" unit list --space "*" --where "Slug='$cluster_name'" -o json 2>/dev/null \
             | jq -r '.[0] | (.SpaceSlug // (.Unit.SpaceSlug // empty))')
         [[ -n "$cp_space" && "$cp_space" != "null" ]] || die "Could not resolve control-plane space for '$cluster_name'"
     fi
-    log_info "Control-plane space: $cp_space"
+    log_info "Control-plane space: $cp_space (context $cp_ctx)"
 
     # Pull the current cluster YAML
     local tmpdir
     tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"; [[ -n "${tenant_ctx:-}" ]] && cub context delete "$tenant_ctx" 2>/dev/null || true' EXIT
+    trap '[[ -n "${tmpdir:-}" ]] && rm -rf "$tmpdir"; [[ -n "${tenant_ctx:-}" ]] && cub context delete "$tenant_ctx" 2>/dev/null || true' EXIT
     local cluster_yaml="$tmpdir/cluster.yaml"
-    cub unit data "$cluster_name" --space "$cp_space" > "$cluster_yaml"
+    cub --context "$cp_ctx" unit data "$cluster_name" --space "$cp_space" > "$cluster_yaml"
+
+    # Fetch the unit's UUID — used to address the SSM-stored worker creds.
+    local unit_id
+    unit_id=$(cub --context "$cp_ctx" unit get "$cluster_name" --space "$cp_space" -o jq=.Unit.UnitID)
+    [[ -n "$unit_id" && "$unit_id" != "null" ]] || die "Failed to read UnitID for $cluster_name"
 
     # Determine current control-plane worker / config slugs (for cleanup)
     local cp_worker_ref cp_config_ref cp_worker_slug cp_config_slug
@@ -1111,11 +1113,11 @@ cmd_reassign() {
         --provider Kubernetes --toolchain Kubernetes/YAML \
         --allow-exists >/dev/null
 
-    # Generate worker manifest with tenant credentials
+    # Generate the cred-free worker manifest (Namespace, SA, ClusterRoleBinding, Deployment).
     local manifest_file="$tmpdir/worker.yaml"
-    generate_worker_manifest "$CONFIGHUB_URL" "$tenant_id" "$tenant_secret" > "$manifest_file"
+    generate_worker_manifest "$CONFIGHUB_URL" > "$manifest_file"
 
-    # Tenant config unit
+    # Tenant config unit (cred-free; secrets live in SSM)
     local tenant_config="${tenant_worker}-config"
     log_info "Creating tenant config unit '$tenant_config' in space '$tenant_space'..."
     cub --context "$tenant_ctx" unit create "$tenant_config" "$manifest_file" \
@@ -1123,8 +1125,22 @@ cmd_reassign() {
         --target "$tenant_target" \
         --allow-exists >/dev/null
 
-    # Push the new manifest onto the VM and roll the worker pod
-    log_info "Applying new manifest to VM $INSTANCE_ID..."
+    # Update the SSM-stored worker creds so a future cloud-init re-run on the VM
+    # picks up the tenant credentials.
+    log_info "Updating SSM-stored worker credentials for unit $unit_id..."
+    aws ssm put-parameter --region "$AWS_REGION" \
+        --name "/cub-vmcluster/$unit_id/cub-worker-id" \
+        --value "$tenant_id" --type String --overwrite >/dev/null
+    aws ssm put-parameter --region "$AWS_REGION" \
+        --name "/cub-vmcluster/$unit_id/cub-worker-secret" \
+        --value "$tenant_secret" --type SecureString --overwrite >/dev/null
+
+    # Update the live k8s Secret on the VM with the tenant credentials, then roll
+    # the worker pod so it reconnects to the tenant org.
+    log_info "Updating worker Secret on VM $INSTANCE_ID..."
+    ssm_exec "$INSTANCE_ID" "kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml -n confighub-system create secret generic cub-worker-secret --from-literal=CONFIGHUB_WORKER_ID=$tenant_id --from-literal=CONFIGHUB_WORKER_SECRET=$tenant_secret --dry-run=client -o yaml | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -"
+
+    # Apply the cred-free manifest in case it has drifted.
     local b64
     b64=$(base64 < "$manifest_file" | tr -d '\n')
     ssm_exec "$INSTANCE_ID" "echo '$b64' | base64 -d | kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f -"
@@ -1135,19 +1151,23 @@ cmd_reassign() {
     yq -i ".spec.worker.name = \"${tenant_space}/${tenant_worker}\"" "$cluster_yaml"
     yq -i ".spec.worker.tenantOrganizationID = \"${tenant_org_id}\"" "$cluster_yaml"
     yq -i 'del(.spec.worker.config)' "$cluster_yaml"
-    cub unit update "$cluster_name" "$cluster_yaml" --space "$cp_space" \
+    cub --context "$cp_ctx" unit update "$cluster_name" "$cluster_yaml" --space "$cp_space" \
         --change-desc "Reassigned cluster to org $tenant_org_id" >/dev/null
 
     # Clean up the now-orphaned control-plane resources
     log_info "Deleting control-plane target '$cp_target_slug'..."
-    cub target delete "$cp_target_slug" --space "$cp_space" 2>/dev/null || \
+    cub --context "$cp_ctx" target delete "$cp_target_slug" --space "$cp_space" 2>/dev/null || \
         log_warn "Failed to delete target '$cp_target_slug'"
     log_info "Deleting control-plane config unit '$cp_config_slug'..."
-    cub unit delete "$cp_config_slug" --space "$cp_space" 2>/dev/null || \
+    cub --context "$cp_ctx" unit delete "$cp_config_slug" --space "$cp_space" 2>/dev/null || \
         log_warn "Failed to delete unit '$cp_config_slug'"
     log_info "Deleting orphaned control-plane worker '$cp_worker_slug'..."
-    cub worker delete "$cp_worker_slug" --space "$cp_space" 2>/dev/null || \
+    cub --context "$cp_ctx" worker delete "$cp_worker_slug" --space "$cp_space" 2>/dev/null || \
         log_warn "Failed to delete worker '$cp_worker_slug'"
+
+    # Delete the temporary tenant context now that we're done with it.
+    cub context delete "$tenant_ctx" >/dev/null 2>&1 || true
+    tenant_ctx=""
 
     log_success "Cluster '$cluster_name' reassigned to ${tenant_space}/${tenant_worker} (org $tenant_org_id)"
 }

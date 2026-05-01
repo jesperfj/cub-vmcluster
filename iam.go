@@ -248,7 +248,13 @@ func buildVMClusterOpsPolicy(account, region string) string {
     {"Sid": "Tagging", "Effect": "Allow", "Action": "ec2:CreateTags",
      "Resource": "arn:aws:ec2:*:*:instance/*"},
     {"Sid": "SSMCommands", "Effect": "Allow",
-     "Action": ["ssm:SendCommand", "ssm:GetCommandInvocation"], "Resource": "*"}
+     "Action": ["ssm:SendCommand", "ssm:GetCommandInvocation"], "Resource": "*"},
+    {"Sid": "SSMParametersForChildren", "Effect": "Allow",
+     "Action": ["ssm:PutParameter", "ssm:DeleteParameter", "ssm:DeleteParameters"],
+     "Resource": "arn:aws:ssm:*:*:parameter/cub-vmcluster/*"},
+    {"Sid": "KMSForChildSecureStrings", "Effect": "Allow",
+     "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey"], "Resource": "*",
+     "Condition": {"StringLike": {"kms:EncryptionContext:PARAMETER_ARN": "arn:aws:ssm:*:*:parameter/cub-vmcluster/*"}}}
   ]
 }`, region, account, account, account)
 }

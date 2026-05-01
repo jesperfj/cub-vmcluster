@@ -139,6 +139,9 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 		log.Printf("[WARN] Failed to delete per-VM IAM resources: %v", err)
 	}
 
+	// Step 6: Clean up SSM-stored worker credentials.
+	b.deleteWorkerCredsFromSSM(awsCtx, topts.RoleARN, region, payload.UnitID.String())
+
 	terminatedAt := time.Now()
 	return ctx.SendStatus(&api.ActionResult{
 		UnitID:            payload.UnitID,
