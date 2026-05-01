@@ -219,9 +219,16 @@ func buildSSMParameterStorePolicy(unitID string) string {
       "Action": ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"],
       "Resource": "*",
       "Condition": {"StringLike": {"kms:EncryptionContext:PARAMETER_ARN": "arn:aws:ssm:*:*:parameter/cub-vmcluster/%s/*"}}
+    },
+    {
+      "Sid": "TagOwnInstance",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {"StringEquals": {"ec2:ResourceTag/confighub:unit-id": "%s"}}
     }
   ]
-}`, unitID, unitID)
+}`, unitID, unitID, unitID)
 }
 
 func buildVMClusterOpsPolicy(account, region string) string {
