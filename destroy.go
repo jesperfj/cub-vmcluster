@@ -56,6 +56,18 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 
 	awsCtx := ctx.Context()
 
+	// If LiveState is empty (e.g., destroy triggered while Apply was still in flight),
+	// fall back to a tag-based lookup so we can still clean up the instance.
+	if existing.InstanceID == "" {
+		ec2c, err := b.ec2Client(awsCtx, topts.RoleARN, region)
+		if err == nil {
+			if id := b.findExistingInstance(awsCtx, ec2c, payload.UnitID.String()); id != "" {
+				log.Printf("[INFO] LiveState was empty; recovered instance %s for unit %s by tag", id, payload.UnitID.String())
+				existing.InstanceID = id
+			}
+		}
+	}
+
 	// Step 1: Delete worker deployment so it disconnects cleanly from ConfigHub
 	if existing.InstanceID != "" {
 		_ = ctx.SendStatus(&api.ActionResult{
