@@ -378,16 +378,36 @@ cmd_init() {
     prompt WORKER_SLUG "Worker slug" "vmcluster-controller"
 
     log_info "Creating worker '$WORKER_SLUG' in space '$WORKER_SPACE'..."
-    cub worker create "$WORKER_SLUG" --space "$WORKER_SPACE" --allow-exists --standard 2>&1 || {
-        die "Failed to create worker"
+    local worker_json
+    worker_json=$(cat <<'EOF'
+{
+  "ProvidedInfo": {
+    "BridgeWorkerInfo": {
+      "SupportedConfigTypes": [
+        {
+          "ProviderType": "VMCluster",
+          "ToolchainType": "Kubernetes/YAML",
+          "Options": [
+            {"Name": "SubnetID",     "DataType": "string", "Description": "VPC subnet to launch instances in"},
+            {"Name": "HostedZoneID", "DataType": "string", "Description": "Route53 hosted zone for DNS records (optional)"},
+            {"Name": "Region",       "DataType": "string", "Description": "AWS region for the target"},
+            {"Name": "RoleARN",      "DataType": "string", "Description": "Optional cross-account IAM role ARN to assume"}
+          ]
+        }
+      ]
     }
+  }
+}
+EOF
+)
+    echo "$worker_json" | cub worker create "$WORKER_SLUG" --space "$WORKER_SPACE" --allow-exists --from-stdin || \
+        die "Failed to create worker"
 
     log_info "Fetching worker credentials..."
-    WORKER_OUTPUT=$(cub worker get "$WORKER_SLUG" --space "$WORKER_SPACE" --json --include-secret 2>&1) || {
-        die "Failed to get worker credentials: $WORKER_OUTPUT"
-    }
-    WORKER_ID=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); w=d.get('BridgeWorker',d); print(w.get('BridgeWorkerID',''))")
-    WORKER_SECRET=$(echo "$WORKER_OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); w=d.get('BridgeWorker',d); print(w.get('Secret',''))")
+    WORKER_OUTPUT=$(cub worker get "$WORKER_SLUG" --space "$WORKER_SPACE" -o json --include-secret) || \
+        die "Failed to get worker credentials"
+    WORKER_ID=$(echo "$WORKER_OUTPUT" | jq -r '.BridgeWorker.BridgeWorkerID // .BridgeWorkerID // empty')
+    WORKER_SECRET=$(echo "$WORKER_OUTPUT" | jq -r '.BridgeWorker.Secret // .Secret // empty')
     if [[ -z "$WORKER_ID" || -z "$WORKER_SECRET" ]]; then
         die "Failed to parse worker credentials"
     fi

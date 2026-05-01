@@ -103,6 +103,12 @@ func (b *VMClusterBridge) Info(opts api.InfoOptions) api.BridgeInfo {
 						ToolchainType: workerapi.ToolchainKubernetesYAML,
 						ProviderType:  ProviderVMCluster,
 					},
+					Options: []api.BridgeOption{
+						{Name: "SubnetID", DataType: "string", Description: "VPC subnet to launch instances in", Required: true},
+						{Name: "HostedZoneID", DataType: "string", Description: "Route53 hosted zone for DNS records (optional)"},
+						{Name: "Region", DataType: "string", Description: "AWS region for the target", Required: true},
+						{Name: "RoleARN", DataType: "string", Description: "Optional cross-account IAM role ARN to assume"},
+					},
 				},
 				AvailableTargets: []api.Target{
 					{
