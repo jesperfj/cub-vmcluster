@@ -72,7 +72,6 @@ type LiveState struct {
 	LaunchTime      string `json:"launchTime"`
 	SecurityGroupID string `json:"securityGroupID"`
 	WorkerID        string `json:"workerID"`
-	WorkerSecret    string `json:"workerSecret,omitempty"`
 	WorkerConnected bool   `json:"workerConnected"`
 	K3sReady        bool   `json:"k3sReady"`
 	DNSRecord       string `json:"dnsRecord"`

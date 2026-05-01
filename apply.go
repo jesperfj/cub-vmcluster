@@ -21,7 +21,6 @@ import (
 // ConfigHubSetupResult holds the resources created/resolved during setup.
 type ConfigHubSetupResult struct {
 	WorkerID     string
-	WorkerSecret string
 	TargetID     string
 	ConfigUnitID string
 	Manifest     string
@@ -107,9 +106,6 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 					}
 					existing.TargetID = setup.TargetID
 					existing.ConfigUnitID = setup.ConfigUnitID
-					if setup.WorkerSecret != "" {
-						existing.WorkerSecret = setup.WorkerSecret
-					}
 					liveStateJSON, _ = json.Marshal(existing)
 				}
 
@@ -501,24 +497,14 @@ func (b *VMClusterBridge) setupConfigHubResources(
 		return nil, fmt.Errorf("failed to ensure worker: %w", err)
 	}
 
-	workerSecret := creds.Secret
 	if created {
 		log.Printf("[INFO] Created worker %s (ID: %s)", workerSlug, creds.WorkerID)
-		// Write fresh creds to SSM as the source of truth for cloud-init.
-		if err := b.writeWorkerCredsToSSM(ctx, topts.RoleARN, topts.Region, payload.UnitID.String(), creds.WorkerID, workerSecret); err != nil {
+		// Write the secret to SSM as the source of truth for cloud-init.
+		if err := b.writeWorkerCredsToSSM(ctx, topts.RoleARN, topts.Region, payload.UnitID.String(), creds.WorkerID, creds.Secret); err != nil {
 			return nil, fmt.Errorf("failed to write worker creds to SSM: %w", err)
 		}
 	} else {
-		log.Printf("[INFO] Worker %s already exists (ID: %s)", workerSlug, creds.WorkerID)
-		// Worker already exists; the secret is in SSM from a prior run. Fall back to
-		// LiveState if migrating from an older controller that stored it there.
-		if workerSecret == "" && existing.WorkerSecret != "" {
-			workerSecret = existing.WorkerSecret
-			// Backfill SSM so future readers don't need the LiveState fallback.
-			if err := b.writeWorkerCredsToSSM(ctx, topts.RoleARN, topts.Region, payload.UnitID.String(), creds.WorkerID, workerSecret); err != nil {
-				log.Printf("[WARN] failed to backfill SSM with worker creds: %v", err)
-			}
-		}
+		log.Printf("[INFO] Worker %s already exists (ID: %s); creds expected in SSM from prior apply", workerSlug, creds.WorkerID)
 	}
 
 	// Step 2: Ensure target exists
@@ -548,7 +534,6 @@ func (b *VMClusterBridge) setupConfigHubResources(
 
 	return &ConfigHubSetupResult{
 		WorkerID:     creds.WorkerID,
-		WorkerSecret: workerSecret,
 		TargetID:     target.TargetID.String(),
 		ConfigUnitID: unit.UnitID.String(),
 		Manifest:     manifest,
@@ -707,7 +692,6 @@ func (b *VMClusterBridge) resizeInstance(
 		LaunchTime:      existing.LaunchTime,
 		SecurityGroupID: existing.SecurityGroupID,
 		WorkerID:        existing.WorkerID,
-		WorkerSecret:    existing.WorkerSecret,
 		WorkerConnected: ready,
 		K3sReady:        ready,
 		DNSRecord:       existing.DNSRecord,
