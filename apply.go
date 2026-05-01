@@ -153,11 +153,11 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to create EC2 client: %v", err))
 	}
 
-	// Orphan recovery: if a tagged instance exists for this cluster, adopt it instead
+	// Orphan recovery: if a tagged instance exists for this unit, adopt it instead
 	// of launching a duplicate. Happens when a previous Apply crashed between
 	// RunInstances and the LiveState write.
-	if id := b.findExistingInstance(awsCtx, ec2c, cluster.Metadata.Name); id != "" {
-		log.Printf("[INFO] Recovering orphaned instance %s for cluster %s", id, cluster.Metadata.Name)
+	if id := b.findExistingInstance(awsCtx, ec2c, payload.UnitID.String()); id != "" {
+		log.Printf("[INFO] Recovering orphaned instance %s for unit %s (cluster %s)", id, payload.UnitID.String(), cluster.Metadata.Name)
 		setup, err := b.setupConfigHubResources(awsCtx, ctx, payload, startTime, &cluster, &existing)
 		if err != nil {
 			return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
@@ -257,6 +257,7 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 					{Key: aws.String("Name"), Value: aws.String(fmt.Sprintf("vmcluster-%s", cluster.Metadata.Name))},
 					{Key: aws.String("confighub:managed-by"), Value: aws.String("cub-vmcluster")},
 					{Key: aws.String("confighub:cluster-name"), Value: aws.String(cluster.Metadata.Name)},
+					{Key: aws.String("confighub:unit-id"), Value: aws.String(payload.UnitID.String())},
 					{Key: aws.String("confighub:status"), Value: aws.String("launching")},
 				},
 			},
@@ -293,12 +294,14 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	return b.completeLaunch(ctx, payload, startTime, ec2c, instanceID, &cluster, &existing, topts, setup, sgID)
 }
 
-// findExistingInstance scans EC2 for any non-terminated instance tagged with this cluster name.
-// Used to recover from a prior Apply that crashed between RunInstances and LiveState write.
-func (b *VMClusterBridge) findExistingInstance(ctx context.Context, ec2c *ec2.Client, clusterName string) string {
+// findExistingInstance scans EC2 for any non-terminated instance tagged with this unit ID.
+// Used to recover from a prior Apply that crashed between RunInstances and the LiveState write.
+// Filters by unit-id (UUID) rather than cluster-name so two units with the same
+// metadata.name can't shadow each other.
+func (b *VMClusterBridge) findExistingInstance(ctx context.Context, ec2c *ec2.Client, unitID string) string {
 	desc, err := ec2c.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		Filters: []ec2types.Filter{
-			{Name: aws.String("tag:confighub:cluster-name"), Values: []string{clusterName}},
+			{Name: aws.String("tag:confighub:unit-id"), Values: []string{unitID}},
 			{Name: aws.String("tag:confighub:managed-by"), Values: []string{"cub-vmcluster"}},
 			{Name: aws.String("instance-state-name"), Values: []string{"pending", "running"}},
 		},
