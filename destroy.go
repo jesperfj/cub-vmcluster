@@ -121,6 +121,11 @@ func (b *VMClusterBridge) Destroy(ctx api.BridgeContext, payload api.BridgePaylo
 		}
 	}
 
+	// Step 5: Tear down per-VM IAM role/profile (no-op for legacy VMs that never had one)
+	if err := b.deletePerVMInstanceProfile(awsCtx, payload.UnitID.String()); err != nil {
+		log.Printf("[WARN] Failed to delete per-VM IAM resources: %v", err)
+	}
+
 	terminatedAt := time.Now()
 	return ctx.SendStatus(&api.ActionResult{
 		UnitID:            payload.UnitID,

@@ -20,11 +20,10 @@ const ProviderVMCluster = api.ProviderType("VMCluster")
 // VMClusterBridge implements the ConfigHub BridgeWorker interface for provisioning
 // single-node k3s clusters on EC2.
 type VMClusterBridge struct {
-	awsCfg            aws.Config
-	roleARN           string
-	hostedZoneID      string
-	subnetID          string
-	instanceProfileID string
+	awsCfg       aws.Config
+	roleARN      string
+	hostedZoneID string
+	subnetID     string
 
 	// ConfigHub API credentials (this worker's own credentials, used to manage child workers)
 	confighubURL    string
@@ -39,8 +38,6 @@ type VMClusterBridgeConfig struct {
 	HostedZoneID string
 	// SubnetID is the VPC subnet to launch instances in.
 	SubnetID string
-	// InstanceProfileName is the IAM instance profile for EC2 instances (SSM access).
-	InstanceProfileName string
 	// ConfigHub API credentials for managing child workers.
 	ConfigHubURL    string
 	ConfigHubID     string
@@ -54,14 +51,13 @@ func NewVMClusterBridge(cfg VMClusterBridgeConfig) (*VMClusterBridge, error) {
 	}
 
 	return &VMClusterBridge{
-		awsCfg:            awsCfg,
-		roleARN:           cfg.RoleARN,
-		hostedZoneID:      cfg.HostedZoneID,
-		subnetID:          cfg.SubnetID,
-		instanceProfileID: cfg.InstanceProfileName,
-		confighubURL:      cfg.ConfigHubURL,
-		confighubID:       cfg.ConfigHubID,
-		confighubSecret:   cfg.ConfigHubSecret,
+		awsCfg:          awsCfg,
+		roleARN:         cfg.RoleARN,
+		hostedZoneID:    cfg.HostedZoneID,
+		subnetID:        cfg.SubnetID,
+		confighubURL:    cfg.ConfigHubURL,
+		confighubID:     cfg.ConfigHubID,
+		confighubSecret: cfg.ConfigHubSecret,
 	}, nil
 }
 

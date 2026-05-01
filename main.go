@@ -11,13 +11,12 @@ func main() {
 	log.Printf("[INFO] Starting cub-vmcluster worker...")
 
 	bridge, err := NewVMClusterBridge(VMClusterBridgeConfig{
-		RoleARN:             os.Getenv("AWS_ROLE_ARN"),
-		HostedZoneID:        os.Getenv("ROUTE53_HOSTED_ZONE_ID"),
-		SubnetID:            os.Getenv("SUBNET_ID"),
-		InstanceProfileName: os.Getenv("INSTANCE_PROFILE_NAME"),
-		ConfigHubURL:        os.Getenv("CONFIGHUB_URL"),
-		ConfigHubID:         os.Getenv("CONFIGHUB_WORKER_ID"),
-		ConfigHubSecret:     os.Getenv("CONFIGHUB_WORKER_SECRET"),
+		RoleARN:         os.Getenv("AWS_ROLE_ARN"),
+		HostedZoneID:    os.Getenv("ROUTE53_HOSTED_ZONE_ID"),
+		SubnetID:        os.Getenv("SUBNET_ID"),
+		ConfigHubURL:    os.Getenv("CONFIGHUB_URL"),
+		ConfigHubID:     os.Getenv("CONFIGHUB_WORKER_ID"),
+		ConfigHubSecret: os.Getenv("CONFIGHUB_WORKER_SECRET"),
 	})
 	if err != nil {
 		log.Fatalf("Failed to create VMCluster bridge: %v", err)

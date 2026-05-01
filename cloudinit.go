@@ -20,14 +20,13 @@ type CloudInitParams struct {
 	WorkerManifest string
 
 	// VMCluster worker self-install
-	InstallVMClusterWorker   bool
-	VMClusterWorkerID        string
-	VMClusterWorkerSecret    string
-	VMClusterWorkerImage     string
-	VMClusterSubnetID        string
-	VMClusterHostedZoneID    string
-	VMClusterInstanceProfile string
-	AWSRegion                string
+	InstallVMClusterWorker bool
+	VMClusterWorkerID      string
+	VMClusterWorkerSecret  string
+	VMClusterWorkerImage   string
+	VMClusterSubnetID      string
+	VMClusterHostedZoneID  string
+	AWSRegion              string
 }
 
 // WorkerManifestParams holds the values needed to generate a cub-worker Kubernetes manifest.
@@ -144,14 +143,13 @@ func renderUserData(cluster *VMCluster, workerManifest string, bridge *VMCluster
 		TLSEmail:       cluster.Spec.Ingress.TLS.Email,
 		WorkerManifest: workerManifest,
 
-		InstallVMClusterWorker:   cluster.Spec.InstallVMClusterWorker,
-		VMClusterWorkerID:        bridge.confighubID,
-		VMClusterWorkerSecret:    bridge.confighubSecret,
-		VMClusterWorkerImage:     vmclusterImage,
-		VMClusterSubnetID:        bridge.subnetID,
-		VMClusterHostedZoneID:    bridge.hostedZoneID,
-		VMClusterInstanceProfile: bridge.instanceProfileID,
-		AWSRegion:                cluster.Spec.Region,
+		InstallVMClusterWorker: cluster.Spec.InstallVMClusterWorker,
+		VMClusterWorkerID:      bridge.confighubID,
+		VMClusterWorkerSecret:  bridge.confighubSecret,
+		VMClusterWorkerImage:   vmclusterImage,
+		VMClusterSubnetID:      bridge.subnetID,
+		VMClusterHostedZoneID:  bridge.hostedZoneID,
+		AWSRegion:              cluster.Spec.Region,
 	}
 
 	var buf bytes.Buffer

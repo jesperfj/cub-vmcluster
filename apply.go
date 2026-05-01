@@ -258,10 +258,14 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	if b.subnetID != "" {
 		runInput.SubnetId = aws.String(b.subnetID)
 	}
-	if b.instanceProfileID != "" {
-		runInput.IamInstanceProfile = &ec2types.IamInstanceProfileSpecification{
-			Name: aws.String(b.instanceProfileID),
-		}
+
+	// Per-VM IAM role/instance profile scoped to /cub-vmcluster/<unitID>/* in SSM.
+	profileName, err := b.ensurePerVMInstanceProfile(awsCtx, payload.UnitID.String(), region, cluster.Spec.InstallVMClusterWorker)
+	if err != nil {
+		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to ensure instance profile: %v", err))
+	}
+	runInput.IamInstanceProfile = &ec2types.IamInstanceProfileSpecification{
+		Name: aws.String(profileName),
 	}
 
 	runResult, err := ec2c.RunInstances(awsCtx, runInput)
