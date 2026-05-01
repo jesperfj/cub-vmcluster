@@ -153,6 +153,18 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to create EC2 client: %v", err))
 	}
 
+	// Orphan recovery: if a tagged instance exists for this cluster, adopt it instead
+	// of launching a duplicate. Happens when a previous Apply crashed between
+	// RunInstances and the LiveState write.
+	if id := b.findExistingInstance(awsCtx, ec2c, cluster.Metadata.Name); id != "" {
+		log.Printf("[INFO] Recovering orphaned instance %s for cluster %s", id, cluster.Metadata.Name)
+		setup, err := b.setupConfigHubResources(awsCtx, ctx, payload, startTime, &cluster, &existing)
+		if err != nil {
+			return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to setup ConfigHub resources: %v", err))
+		}
+		return b.completeLaunch(ctx, payload, startTime, ec2c, id, &cluster, &existing, topts, setup, "")
+	}
+
 	// Step 1: Security Group
 	_ = ctx.SendStatus(&api.ActionResult{
 		UnitID:            payload.UnitID,
@@ -275,11 +287,51 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("failed to launch instance: %v", err))
 	}
 
-	instance := runResult.Instances[0]
-	instanceID := aws.ToString(instance.InstanceId)
+	instanceID := aws.ToString(runResult.Instances[0].InstanceId)
 	log.Printf("[INFO] Instance launched: %s", instanceID)
 
-	// Step 6: Wait for instance running
+	return b.completeLaunch(ctx, payload, startTime, ec2c, instanceID, &cluster, &existing, topts, setup, sgID)
+}
+
+// findExistingInstance scans EC2 for any non-terminated instance tagged with this cluster name.
+// Used to recover from a prior Apply that crashed between RunInstances and LiveState write.
+func (b *VMClusterBridge) findExistingInstance(ctx context.Context, ec2c *ec2.Client, clusterName string) string {
+	desc, err := ec2c.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		Filters: []ec2types.Filter{
+			{Name: aws.String("tag:confighub:cluster-name"), Values: []string{clusterName}},
+			{Name: aws.String("tag:confighub:managed-by"), Values: []string{"cub-vmcluster"}},
+			{Name: aws.String("instance-state-name"), Values: []string{"pending", "running"}},
+		},
+	})
+	if err != nil {
+		return ""
+	}
+	for _, r := range desc.Reservations {
+		for _, inst := range r.Instances {
+			return aws.ToString(inst.InstanceId)
+		}
+	}
+	return ""
+}
+
+// completeLaunch is the post-RunInstances flow shared by new launches and orphan recovery:
+// wait for the instance to become running, update DNS, poll readiness, write LiveState.
+// sgID may be empty for orphan recovery (will be looked up from the running instance).
+func (b *VMClusterBridge) completeLaunch(
+	ctx api.BridgeContext,
+	payload api.BridgePayload,
+	startTime time.Time,
+	ec2c *ec2.Client,
+	instanceID string,
+	cluster *VMCluster,
+	existing *LiveState,
+	topts BridgeTargetOptions,
+	setup *ConfigHubSetupResult,
+	sgID string,
+) error {
+	awsCtx := ctx.Context()
+
+	// Wait for instance running
 	_ = ctx.SendStatus(&api.ActionResult{
 		UnitID:            payload.UnitID,
 		SpaceID:           payload.SpaceID,
@@ -300,7 +352,6 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 		return b.sendFailed(ctx, payload, startTime, fmt.Sprintf("instance %s failed to start: %v", instanceID, err))
 	}
 
-	// Get public IP
 	desc, err := ec2c.DescribeInstances(awsCtx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{instanceID},
 	})
@@ -311,9 +362,12 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 	inst := desc.Reservations[0].Instances[0]
 	publicIP := aws.ToString(inst.PublicIpAddress)
 	privateIP := aws.ToString(inst.PrivateIpAddress)
+	if sgID == "" && len(inst.SecurityGroups) > 0 {
+		sgID = aws.ToString(inst.SecurityGroups[0].GroupId)
+	}
 	log.Printf("[INFO] Instance %s running at %s", instanceID, publicIP)
 
-	// Step 7: DNS record
+	// DNS
 	if cluster.Spec.Ingress.Domain != "" && topts.HostedZoneID != "" {
 		_ = ctx.SendStatus(&api.ActionResult{
 			UnitID:            payload.UnitID,
@@ -327,14 +381,12 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 				StartedAt: startTime,
 			},
 		})
-
 		if err := b.upsertDNSRecord(awsCtx, topts.RoleARN, topts.HostedZoneID, cluster.Spec.Ingress.Domain, publicIP); err != nil {
 			log.Printf("[WARN] Failed to create DNS record: %v", err)
-			// Non-fatal — continue without DNS
 		}
 	}
 
-	// Step 8: Poll for readiness
+	// Readiness
 	_ = ctx.SendStatus(&api.ActionResult{
 		UnitID:            payload.UnitID,
 		SpaceID:           payload.SpaceID,
@@ -347,10 +399,8 @@ func (b *VMClusterBridge) Apply(ctx api.BridgeContext, payload api.BridgePayload
 			StartedAt: startTime,
 		},
 	})
-
 	ready := b.pollInstanceReady(ctx, payload, startTime, ec2c, instanceID, 5*time.Minute)
 
-	// Build LiveState
 	ls := LiveState{
 		InstanceID:      instanceID,
 		PublicIP:        publicIP,

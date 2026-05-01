@@ -437,8 +437,7 @@ WORKER_SLUG=$WORKER_SLUG
 AWS_REGION=$AWS_REGION
 EOF
 
-    # Docker AWS auth
-    DOCKER_CMD="docker run --rm --env-file .env"
+    # Persist AWS auth into .env for the controller container
     case "$AWS_AUTH_METHOD" in
         env)
             cat >> "$ENV_FILE" <<EOF
@@ -451,13 +450,8 @@ EOF
             ;;
         profile)
             echo "AWS_PROFILE=$AWS_PROFILE" >> "$ENV_FILE"
-            DOCKER_CMD="$DOCKER_CMD -v \$HOME/.aws:/root/.aws:ro"
-            ;;
-        *)
-            DOCKER_CMD="$DOCKER_CMD -v \$HOME/.aws:/root/.aws:ro"
             ;;
     esac
-    DOCKER_CMD="$DOCKER_CMD ghcr.io/jesperfj/cub-vmcluster:latest"
 
     log_success "Configuration written to .env"
 
@@ -517,9 +511,9 @@ spec:
     echo ""
     echo "  Next steps:"
     echo ""
-    echo "  1. Start the worker:"
+    echo "  1. Start the controller:"
     echo ""
-    echo "     $DOCKER_CMD"
+    echo "     ./vmctl controller"
     echo ""
     echo "  2. Open ConfigHub and verify the worker is connected"
     echo "  3. Apply the '${CLUSTER_NAME}' unit to provision your first cluster"
@@ -1158,6 +1152,20 @@ cmd_reassign() {
     log_success "Cluster '$cluster_name' reassigned to ${tenant_space}/${tenant_worker} (org $tenant_org_id)"
 }
 
+cmd_controller() {
+    require_env
+    local image="${CUB_VMCLUSTER_IMAGE:-ghcr.io/jesperfj/cub-vmcluster:latest}"
+
+    local -a docker_args=(--rm --pull always --env-file "$ENV_FILE")
+    # Mount ~/.aws when we're not using inline env var creds
+    if [[ -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+        docker_args+=(-v "$HOME/.aws:/root/.aws:ro")
+    fi
+
+    log_info "Starting vmcluster-controller (image $image, Ctrl-C to stop)"
+    exec docker run "${docker_args[@]}" "$image"
+}
+
 cmd_add_target() {
     require_env
     local target_slug="${1:?Usage: vmctl add-target <slug> --region <region> [--subnet <id>] [--zone <id>]}"
@@ -1284,6 +1292,7 @@ usage() {
     echo ""
     echo "Setup:"
     echo "  init [--skip-infra]        Set up AWS infra, ConfigHub worker, and first cluster"
+    echo "  controller                 Start the vmcluster-controller in Docker"
     echo "  add-target <slug> --region <r> [--subnet <id>] [--zone <id>]"
     echo "                             Add another VMCluster target (e.g. for a different region)"
     echo "  teardown [--force]         Remove all AWS infrastructure"
@@ -1301,6 +1310,7 @@ usage() {
 
 case "${1:-}" in
     init)       shift; cmd_init "$@" ;;
+    controller) shift; cmd_controller "$@" ;;
     add-target) shift; cmd_add_target "$@" ;;
     teardown)   shift; cmd_teardown "$@" ;;
     status)     cmd_status ;;
