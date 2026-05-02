@@ -19,6 +19,7 @@ imds() { curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/
 INSTANCE_ID=$(imds instance-id)
 REGION=$(imds placement/region)
 PUBLIC_IP=$(imds public-ipv4)
+PRIVATE_IP=$(imds local-ipv4)
 
 tag_status() {
   aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" \
@@ -117,6 +118,24 @@ VMCMANIFEST
 {{end}}
 
 {{if .IngressEnabled}}
+# k3s runs with --disable servicelb, so Traefik's LoadBalancer Service stays
+# <pending>. Adding the node's private IP as externalIPs makes kube-proxy DNAT
+# inbound :80/:443 to Traefik. AWS rewrites the EIP to the private IP at the ENI,
+# so packets arrive on the OS with dst = $PRIVATE_IP.
+cat > /var/lib/rancher/k3s/server/manifests/traefik-config.yaml <<TRAEFIK
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    service:
+      spec:
+        externalIPs:
+          - $PRIVATE_IP
+TRAEFIK
+
 tag_status "deploying-cert-manager"
 
 # --- Deploy cert-manager ---
